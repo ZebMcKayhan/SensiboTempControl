@@ -69,7 +69,7 @@ WEB_PASSWORD = "changeme"
 SESSION_SECRET_KEY = "change-this-to-a-random-string"  # used to sign session cookies
 
 # ── Log file ──────────────────────────────────────────────────────────────────
-LOG_FILE = "sensibo_reg.log"    # relative to script directory; created automatically
+LOG_FILE = "/tmp/sensibo_reg.log"    # relative to script directory; created automatically
 
 # =============================================================================
 # END OF CONFIG — do not edit below unless you know what you're doing
