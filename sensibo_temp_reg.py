@@ -25,7 +25,7 @@ a device from your account.
 # =============================================================================
 
 # ── Sensibo API ───────────────────────────────────────────────────────────────
-SENSIBO_API_KEY   = "PutYourAPIKeyHere"
+SENSIBO_API_KEY   = "YOUR_API_KEY_HERE"
 SENSIBO_DEVICE_ID = ""          # leave blank → interactive device picker on startup
 
 # ── Target room temperature ───────────────────────────────────────────────────
