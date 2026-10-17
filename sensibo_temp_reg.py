@@ -25,15 +25,15 @@ a device from your account.
 # =============================================================================
 
 # ── Sensibo API ───────────────────────────────────────────────────────────────
-SENSIBO_API_KEY   = "YOUR_API_KEY"
+SENSIBO_API_KEY   = "PutYourAPIKeyHere"
 SENSIBO_DEVICE_ID = ""          # leave blank → interactive device picker on startup
 
 # ── Target room temperature ───────────────────────────────────────────────────
-TARGET_ROOM_TEMP = 22.5          # °C  — adjust seasonally (e.g. 23 in deep winter)
+TARGET_ROOM_TEMP = 22.8          # °C  — adjust seasonally (e.g. 23 in deep winter)
 
 # ── Regulation thresholds ─────────────────────────────────────────────────────
-UNDERSHOOT_THRESHOLD = 0.5      # °C below target → increase AC set-point by 1
-OVERSHOOT_THRESHOLD  = 0.6      # °C above target → decrease AC set-point by 1
+UNDERSHOOT_THRESHOLD = 0.4      # °C below target → increase AC set-point by 1
+OVERSHOOT_THRESHOLD  = 0.4      # °C above target → decrease AC set-point by 1
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
 AC_TEMP_MIN = 20                # °C — never set AC below this
@@ -58,11 +58,12 @@ FAN_SPEED_TABLE = {
 }
 
 # ── Polling ───────────────────────────────────────────────────────────────────
-CHECK_INTERVAL_MINUTES = 30     # minutes between regulation checks
+READ_INTERVAL_MINUTES  = 5      # minutes between sensor read + regulation checks
+CHECK_INTERVAL_MINUTES = 30     # minimum minutes between AC set-point changes
 
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_HOST     = "0.0.0.0"
-WEB_PORT     = 8080
+WEB_PORT     = 8585
 WEB_USERNAME = "admin"
 WEB_PASSWORD = "changeme"
 SESSION_SECRET_KEY = "change-this-to-a-random-string"  # used to sign session cookies
@@ -129,7 +130,7 @@ def get_shared_state() -> dict:
 # Log file helpers
 # ---------------------------------------------------------------------------
 _log_lock = threading.Lock()
-LOG_FIELDS = ["timestamp", "room_temp", "ac_set_temp", "delta", "ac_action", "fan_action"]
+LOG_FIELDS = ["timestamp", "room_temp", "ac_set_temp", "delta", "ac_action", "fan_action", "changed"]
 
 def _log_file_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
@@ -154,6 +155,24 @@ def read_log_rows(max_rows: int = 200) -> list[dict]:
         with open(path, "r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
     return list(reversed(rows[-max_rows:]))
+
+def read_event_rows(max_rows: int = 50) -> list[dict]:
+    """
+    Return up to *max_rows* most-recent log rows where something changed
+    (changed == 'yes'), newest first.  Falls back to all rows if the
+    'changed' column is absent (old log files without that column).
+    """
+    path = _log_file_path()
+    if not os.path.exists(path):
+        return []
+    with _log_lock:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    # If old log file has no 'changed' column, return everything
+    if rows and "changed" not in rows[0]:
+        return list(reversed(rows[-max_rows:]))
+    event_rows = [r for r in rows if r.get("changed") == "yes"]
+    return list(reversed(event_rows[-max_rows:]))
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +229,22 @@ class SensiboClient:
                 return pod
         raise SensiboError(f"Device '{device_id}' not found in account")
 
+    def set_ac_state_fields(self, device_id: str, current_state: dict, updates: dict) -> None:
+        """
+        Apply *updates* to the AC state in a single API call.
+
+        Sends the full acState with the requested fields overridden.  This
+        avoids multiple round-trips (and multiple AC beeps) when we need to
+        change both targetTemperature and fanLevel simultaneously.
+        """
+        new_state = dict(current_state)
+        new_state.update(updates)
+        self._request(
+            "POST",
+            f"/pods/{device_id}/acStates",
+            json={"acState": new_state},
+        )
+
     def set_ac_state_field(self, device_id: str, field: str, value) -> None:
         """Change a single field of the AC state (e.g. targetTemperature, fanLevel)."""
         self._request(
@@ -246,11 +281,15 @@ class SensiboClient:
 # Regulation loop
 # ---------------------------------------------------------------------------
 
-def regulate(client: SensiboClient, device_id: str) -> None:
+def regulate(client: SensiboClient, device_id: str, allow_ac_change: bool) -> None:
     """
-    Stateless regulation cycle.  Reads current state from the Sensibo API,
-    decides whether to adjust AC set-point and/or fan speed, applies any
-    changes, and appends a log row.
+    Regulation cycle.  Reads current state from the Sensibo API, decides
+    whether to adjust AC set-point and/or fan speed, applies any changes in a
+    single API call, and appends a log row.
+
+    *allow_ac_change* controls whether the AC set-point may be modified this
+    cycle.  Even when False the sensor data is still read and logged so the
+    dashboard stays current.
     """
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     ac_action = "Error"
@@ -258,6 +297,7 @@ def regulate(client: SensiboClient, device_id: str) -> None:
     room_temp = None
     ac_set_temp = None
     delta = None
+    changed = False   # True when any AC/fan command was actually sent
 
     try:
         # 1. Read current AC state and room measurement (single API call)
@@ -296,58 +336,94 @@ def regulate(client: SensiboClient, device_id: str) -> None:
             # 3. Temperature regulation
             delta = round(room_temp - TARGET_ROOM_TEMP, 2)
             log.info(
-                "Room: %.1f°C  Target: %.1f°C  AC set: %d°C  Delta: %+.2f°C",
+                "Room: %.1f°C  Target: %.1f°C  AC set: %d°C  Delta: %+.2f°C%s",
                 room_temp, TARGET_ROOM_TEMP, ac_set_temp, delta,
+                "" if allow_ac_change else "  [set-point locked — rate limit]",
             )
 
-            if delta < -UNDERSHOOT_THRESHOLD:
-                new_temp = min(ac_set_temp + 1, AC_TEMP_MAX)
-                if new_temp != ac_set_temp:
-                    client.set_ac_state_field(device_id, "targetTemperature", new_temp)
-                    log.info("Set-point increased: %d → %d°C", ac_set_temp, new_temp)
-                    ac_action = f"Increased set-point to {new_temp}°C"
-                    ac_set_temp = new_temp
+            # Decide desired new set-point (may be same as current)
+            desired_temp = ac_set_temp
+            if allow_ac_change:
+                if delta < -UNDERSHOOT_THRESHOLD:
+                    new_temp = min(ac_set_temp + 1, AC_TEMP_MAX)
+                    if new_temp != ac_set_temp:
+                        desired_temp = new_temp
+                        ac_action = f"Increased set-point to {new_temp}°C"
+                    else:
+                        log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", AC_TEMP_MAX)
+                        ac_action = f"At max limit ({AC_TEMP_MAX}°C), no increase"
+                elif delta > OVERSHOOT_THRESHOLD:
+                    new_temp = max(ac_set_temp - 1, AC_TEMP_MIN)
+                    if new_temp != ac_set_temp:
+                        desired_temp = new_temp
+                        ac_action = f"Decreased set-point to {new_temp}°C"
+                    else:
+                        log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", AC_TEMP_MIN)
+                        ac_action = f"At min limit ({AC_TEMP_MIN}°C), no decrease"
                 else:
-                    log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", AC_TEMP_MAX)
-                    ac_action = f"At max limit ({AC_TEMP_MAX}°C), no increase"
-
-            elif delta > OVERSHOOT_THRESHOLD:
-                new_temp = max(ac_set_temp - 1, AC_TEMP_MIN)
-                if new_temp != ac_set_temp:
-                    client.set_ac_state_field(device_id, "targetTemperature", new_temp)
-                    log.info("Set-point decreased: %d → %d°C", ac_set_temp, new_temp)
-                    ac_action = f"Decreased set-point to {new_temp}°C"
-                    ac_set_temp = new_temp
-                else:
-                    log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", AC_TEMP_MIN)
-                    ac_action = f"At min limit ({AC_TEMP_MIN}°C), no decrease"
+                    ac_action = "No change"
             else:
-                ac_action = "No change"
+                ac_action = "No change (rate limited)"
 
-            # 4. Fan speed adjustment (only if set-point is in table)
-            if ac_set_temp in FAN_SPEED_TABLE:
-                target_fan_int = FAN_SPEED_TABLE[ac_set_temp]
+            # 4. Determine desired fan speed
+            desired_fan = None   # None means "no fan change needed"
+            target_set_for_fan = desired_temp   # use the new set-point for fan lookup
+            if target_set_for_fan in FAN_SPEED_TABLE:
+                target_fan_int = FAN_SPEED_TABLE[target_set_for_fan]
                 target_fan_str = INT_TO_FAN.get(target_fan_int)
                 if target_fan_str is None:
                     log.warning("Fan speed integer %d has no API mapping, skipping", target_fan_int)
                     fan_action = f"Invalid fan speed int {target_fan_int}"
                 elif ac_fan != target_fan_str:
-                    client.set_ac_state_field(device_id, "fanLevel", target_fan_str)
-                    log.info("Fan speed set to %d (%s)", target_fan_int, target_fan_str)
+                    desired_fan = target_fan_str
                     fan_action = f"Fan → {target_fan_int} ({target_fan_str})"
-                    update_shared_state(ac_fan=target_fan_str)
                 else:
                     fan_action = f"Fan unchanged ({target_fan_int})"
             else:
-                fan_action = f"Fan unchanged (no table entry for {ac_set_temp}°C)"
-                log.info("No fan table entry for set-point %d°C, fan left as-is", ac_set_temp)
+                fan_action = f"Fan unchanged (no table entry for {target_set_for_fan}°C)"
+                log.info("No fan table entry for set-point %d°C, fan left as-is", target_set_for_fan)
+
+            # 5. Apply changes — combine into a single API call if possible
+            temp_changed = desired_temp != ac_set_temp
+            fan_changed  = desired_fan is not None
+
+            if temp_changed or fan_changed:
+                updates: dict = {}
+                if temp_changed:
+                    updates["targetTemperature"] = desired_temp
+                    log.info(
+                        "Set-point %s: %d → %d°C",
+                        "increased" if desired_temp > ac_set_temp else "decreased",
+                        ac_set_temp, desired_temp,
+                    )
+                if fan_changed:
+                    updates["fanLevel"] = desired_fan
+                    log.info("Fan speed → %s", desired_fan)
+
+                if temp_changed and fan_changed:
+                    # Single combined call — avoids double beep
+                    client.set_ac_state_fields(device_id, ac_state, updates)
+                elif temp_changed:
+                    client.set_ac_state_field(device_id, "targetTemperature", desired_temp)
+                else:
+                    client.set_ac_state_field(device_id, "fanLevel", desired_fan)
+
+                # Update shared state to reflect applied changes
+                if temp_changed:
+                    ac_set_temp = desired_temp
+                if fan_changed:
+                    update_shared_state(ac_fan=desired_fan, ac_set_temp=ac_set_temp)
+                else:
+                    update_shared_state(ac_set_temp=ac_set_temp)
+
+                changed = True
 
     except SensiboError as exc:
         log.error("Regulation cycle failed: %s", exc)
         ac_action = f"API Error: {exc}"
         fan_action = "N/A"
 
-    # 5. Append log row
+    # 6. Append log row (every cycle so log is complete)
     append_log_row({
         "timestamp": now,
         "room_temp": f"{room_temp:.1f}" if room_temp is not None else "N/A",
@@ -355,17 +431,45 @@ def regulate(client: SensiboClient, device_id: str) -> None:
         "delta": f"{delta:+.2f}" if delta is not None else "N/A",
         "ac_action": ac_action,
         "fan_action": fan_action,
+        "changed": "yes" if changed else "no",
     })
 
 
 def regulation_loop(client: SensiboClient, device_id: str) -> None:
-    """Background thread: run regulate() then sleep CHECK_INTERVAL_MINUTES."""
-    log.info("Regulation loop started. Interval: %d min", CHECK_INTERVAL_MINUTES)
+    """
+    Background thread: poll the sensor every READ_INTERVAL_MINUTES but only
+    allow AC set-point changes once per CHECK_INTERVAL_MINUTES.
+    """
+    log.info(
+        "Regulation loop started. Read every %d min, AC changes every %d min.",
+        READ_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES,
+    )
+    last_ac_change_time: float = 0.0   # epoch seconds of last set-point change
+
     while True:
-        log.info("--- Regulation cycle start ---")
-        regulate(client, device_id)
-        log.info("--- Next check in %d min ---", CHECK_INTERVAL_MINUTES)
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+        now_epoch = time.time()
+        minutes_since_last = (now_epoch - last_ac_change_time) / 60.0
+        allow_ac_change = minutes_since_last >= CHECK_INTERVAL_MINUTES
+
+        log.info(
+            "--- Regulation cycle start (AC change %s) ---",
+            "allowed" if allow_ac_change else f"locked for {CHECK_INTERVAL_MINUTES - minutes_since_last:.0f} more min",
+        )
+
+        # Remember set-point before the cycle to detect if it was changed
+        state_before = get_shared_state()
+        set_temp_before = state_before.get("ac_set_temp")
+
+        regulate(client, device_id, allow_ac_change=allow_ac_change)
+
+        state_after = get_shared_state()
+        set_temp_after = state_after.get("ac_set_temp")
+        if set_temp_after != set_temp_before:
+            last_ac_change_time = time.time()
+
+        log.info("--- Next read in %d min ---", READ_INTERVAL_MINUTES)
+        time.sleep(READ_INTERVAL_MINUTES * 60)
+
 
 
 # ---------------------------------------------------------------------------
@@ -516,13 +620,13 @@ _DASHBOARD_TEMPLATE = """
     </div>
     <p style="font-size:0.75rem;color:#888;margin-top:0.75rem">
       Last checked: <span id="last_checked">{{ s.last_checked if s.last_checked else 'Not yet' }}</span>
-      &nbsp;·&nbsp; Next refresh in <span id="countdown">60</span>s
+      &nbsp;·&nbsp; Next status refresh in <span id="countdown">300</span>s
     </p>
   </div>
 
-  <!-- Recent events -->
+  <!-- Recent events (changes only) -->
   <div class="card">
-    <h2>Recent Events</h2>
+    <h2>Recent Events <span style="font-size:0.75rem;font-weight:400;color:#888">(changes only — see Full Log for all checks)</span></h2>
     {% if rows %}
     <table>
       <thead><tr>
@@ -543,7 +647,7 @@ _DASHBOARD_TEMPLATE = """
       </tbody>
     </table>
     {% else %}
-    <p style="color:#888;font-size:0.85rem">No log entries yet.</p>
+    <p style="color:#888;font-size:0.85rem">No changes logged yet.</p>
     {% endif %}
   </div>
 
@@ -557,7 +661,8 @@ _DASHBOARD_TEMPLATE = """
         <tr><td>OVERSHOOT_THRESHOLD</td><td>{{ cfg.OVERSHOOT_THRESHOLD }} °C</td></tr>
         <tr><td>AC_TEMP_MIN</td><td>{{ cfg.AC_TEMP_MIN }} °C</td></tr>
         <tr><td>AC_TEMP_MAX</td><td>{{ cfg.AC_TEMP_MAX }} °C</td></tr>
-        <tr><td>CHECK_INTERVAL_MINUTES</td><td>{{ cfg.CHECK_INTERVAL_MINUTES }} min</td></tr>
+        <tr><td>READ_INTERVAL_MINUTES</td><td>{{ cfg.READ_INTERVAL_MINUTES }} min (sensor polling)</td></tr>
+        <tr><td>CHECK_INTERVAL_MINUTES</td><td>{{ cfg.CHECK_INTERVAL_MINUTES }} min (min between AC changes)</td></tr>
         <tr><td>FAN_SPEED_TABLE</td><td>{{ cfg.FAN_SPEED_TABLE }}</td></tr>
       </tbody>
     </table>
@@ -566,13 +671,13 @@ _DASHBOARD_TEMPLATE = """
 </div>
 
 <script>
-let countdown = 60;
+let countdown = 300;
 const countEl = document.getElementById('countdown');
 setInterval(() => {
   countdown--;
   if (countEl) countEl.textContent = countdown;
   if (countdown <= 0) {
-    countdown = 60;
+    countdown = 300;
     fetch('/api/status').then(r => r.json()).then(d => {
       const set = (id, v) => { const el = document.getElementById(id); if(el && v !== undefined) el.textContent = v; };
       set('room_temp',   d.room_temp   ?? '—');
@@ -594,6 +699,7 @@ setInterval(() => {
 </script>
 </body></html>
 """
+
 
 _LOG_TEMPLATE = """
 <!doctype html>
@@ -660,7 +766,7 @@ def logout():
 @login_required
 def dashboard():
     s = get_shared_state()
-    rows = read_log_rows(max_rows=20)
+    rows = read_event_rows(max_rows=20)   # only rows where something changed
 
     delta_class = "delta-ok"
     if s.get("room_temp") and s["room_temp"] != "N/A":
@@ -681,10 +787,12 @@ def dashboard():
             "OVERSHOOT_THRESHOLD": OVERSHOOT_THRESHOLD,
             "AC_TEMP_MIN": AC_TEMP_MIN,
             "AC_TEMP_MAX": AC_TEMP_MAX,
+            "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
             "CHECK_INTERVAL_MINUTES": CHECK_INTERVAL_MINUTES,
             "FAN_SPEED_TABLE": FAN_SPEED_TABLE,
         },
     )
+
 
 @app.route("/api/status")
 @login_required
