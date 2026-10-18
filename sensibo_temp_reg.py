@@ -175,6 +175,52 @@ def read_event_rows(max_rows: int = 50) -> list[dict]:
     return list(reversed(event_rows[-max_rows:]))
 
 
+def read_chart_rows(span_hours: int = 24, offset_periods: int = 0) -> list[dict]:
+    """
+    Return log rows within a rolling time window, oldest first, for charting.
+
+    *span_hours*     — width of the window in hours (default 24 = "last 24 h").
+    *offset_periods* — shift the window backwards by this many full span_hours
+                       periods (0 = current/live window, 1 = previous period, …).
+                       Reserved for future Day/Week/Month selector support.
+
+    Only rows with numeric room_temp and ac_set_temp are included (N/A rows
+    from API errors are skipped so the chart stays clean).
+    """
+    from datetime import timedelta
+
+    path = _log_file_path()
+    if not os.path.exists(path):
+        return []
+
+    now = datetime.now()
+    window_end   = now   - timedelta(hours=span_hours * offset_periods)
+    window_start = window_end - timedelta(hours=span_hours)
+
+    with _log_lock:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+    result = []
+    for r in rows:
+        ts_str = r.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if not (window_start <= ts <= window_end):
+            continue
+        # Skip rows where temperature values are not numeric
+        try:
+            float(r["room_temp"])
+            float(r["ac_set_temp"])
+        except (ValueError, KeyError):
+            continue
+        result.append(r)
+
+    return result  # oldest first
+
+
 # ---------------------------------------------------------------------------
 # Sensibo API client
 # ---------------------------------------------------------------------------
@@ -573,6 +619,19 @@ _DASHBOARD_TEMPLATE = """
   <meta charset="utf-8">
   <title>Sensibo Reg — Dashboard</title>
   """ + _BASE_STYLE + """
+  <style>
+    /* Chart styles */
+    .chart-wrap { position: relative; width: 100%; }
+    .chart-wrap svg { width: 100%; height: 260px; display: block; overflow: visible; }
+    .chart-legend {
+      display: flex; gap: 1.25rem; flex-wrap: wrap;
+      margin-top: 0.6rem; font-size: 0.78rem; color: #555;
+    }
+    .legend-item { display: flex; align-items: center; gap: 0.35rem; }
+    .legend-swatch { width: 28px; height: 3px; border-radius: 2px; }
+    .legend-dashed { border-top: 2px dashed; height: 0; width: 28px; }
+    .chart-empty { color: #aaa; font-size: 0.85rem; padding: 1rem 0; }
+  </style>
 </head>
 <body>
 <div class="navbar">
@@ -620,13 +679,38 @@ _DASHBOARD_TEMPLATE = """
     </div>
     <p style="font-size:0.75rem;color:#888;margin-top:0.75rem">
       Last checked: <span id="last_checked">{{ s.last_checked if s.last_checked else 'Not yet' }}</span>
-      &nbsp;·&nbsp; Next status refresh in <span id="countdown">300</span>s
+      &nbsp;·&nbsp; Next refresh in <span id="countdown">300</span>s
     </p>
+  </div>
+
+  <!-- 24 h Temperature Chart -->
+  <div class="card">
+    <h2>Last 24 Hours</h2>
+    <div class="chart-wrap">
+      <svg id="tempChart" viewBox="0 0 900 240" preserveAspectRatio="none"
+           aria-label="24-hour temperature chart"></svg>
+      <p class="chart-empty" id="chartEmpty" style="display:none">No data for the last 24 hours.</p>
+    </div>
+    <div class="chart-legend">
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#2563eb"></div>
+        <span>Room Temp</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#f59e0b"></div>
+        <span>AC Set-Point</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-dashed" style="border-color:#16a34a"></div>
+        <span>Target Temp</span>
+      </div>
+    </div>
   </div>
 
   <!-- Recent events (changes only) -->
   <div class="card">
     <h2>Recent Events <span style="font-size:0.75rem;font-weight:400;color:#888">(changes only — see Full Log for all checks)</span></h2>
+    <div id="events-wrap">
     {% if rows %}
     <table>
       <thead><tr>
@@ -649,6 +733,7 @@ _DASHBOARD_TEMPLATE = """
     {% else %}
     <p style="color:#888;font-size:0.85rem">No changes logged yet.</p>
     {% endif %}
+    </div>
   </div>
 
   <!-- Config summary -->
@@ -671,6 +756,178 @@ _DASHBOARD_TEMPLATE = """
 </div>
 
 <script>
+// ── Chart renderer ────────────────────────────────────────────────────────────
+(function () {
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const W = 900, H = 240;
+  const PAD = { top: 14, right: 16, bottom: 36, left: 44 };
+
+  function makeSvgEl(tag, attrs) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    return el;
+  }
+
+  function renderChart(data) {
+    const svg = document.getElementById('tempChart');
+    const emptyMsg = document.getElementById('chartEmpty');
+    // Clear previous content
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    if (!data || !data.points || data.points.length === 0) {
+      svg.style.display = 'none';
+      emptyMsg.style.display = '';
+      return;
+    }
+    svg.style.display = '';
+    emptyMsg.style.display = 'none';
+
+    const pts = data.points;
+    const targetTemp = data.target_temp;
+
+    // Time domain: fixed 24 h window ending "now"
+    const tEnd   = Date.now();
+    const tStart = tEnd - 24 * 60 * 60 * 1000;
+
+    // Value domain: auto from data + target, with a small padding
+    const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp]).concat([targetTemp]);
+    const vMin = Math.min(...allVals) - 0.5;
+    const vMax = Math.max(...allVals) + 0.5;
+
+    const plotW = W - PAD.left - PAD.right;
+    const plotH = H - PAD.top  - PAD.bottom;
+
+    function tx(epochMs) {
+      return PAD.left + ((epochMs - tStart) / (tEnd - tStart)) * plotW;
+    }
+    function ty(val) {
+      return PAD.top + plotH - ((val - vMin) / (vMax - vMin)) * plotH;
+    }
+
+    // ── Grid lines & Y-axis labels ─────────────────────────────────────────
+    const yTicks = 5;
+    for (let i = 0; i <= yTicks; i++) {
+      const val  = vMin + (vMax - vMin) * (i / yTicks);
+      const y    = ty(val);
+      // grid line
+      svg.appendChild(makeSvgEl('line', {
+        x1: PAD.left, y1: y, x2: W - PAD.right, y2: y,
+        stroke: '#e5e7eb', 'stroke-width': '1',
+      }));
+      // label
+      const lbl = makeSvgEl('text', {
+        x: PAD.left - 5, y: y + 4,
+        'text-anchor': 'end', 'font-size': '11', fill: '#888',
+      });
+      lbl.textContent = val.toFixed(1);
+      svg.appendChild(lbl);
+    }
+
+    // ── X-axis time labels (every 4 h) ────────────────────────────────────
+    for (let h = 0; h <= 24; h += 4) {
+      const epochMs = tEnd - (24 - h) * 3600 * 1000;
+      const x = tx(epochMs);
+      svg.appendChild(makeSvgEl('line', {
+        x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
+        stroke: '#e5e7eb', 'stroke-width': '1',
+      }));
+      const d = new Date(epochMs);
+      const label = d.getHours().toString().padStart(2, '0') + ':' +
+                    d.getMinutes().toString().padStart(2, '0');
+      const lbl = makeSvgEl('text', {
+        x: x, y: H - PAD.bottom + 14,
+        'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+      });
+      lbl.textContent = label;
+      svg.appendChild(lbl);
+    }
+
+    // ── Clip rect so lines don't overflow plot area ───────────────────────
+    const clipId = 'chartClip';
+    const defs = makeSvgEl('defs', {});
+    const clip = makeSvgEl('clipPath', { id: clipId });
+    clip.appendChild(makeSvgEl('rect', {
+      x: PAD.left, y: PAD.top, width: plotW, height: plotH,
+    }));
+    defs.appendChild(clip);
+    svg.appendChild(defs);
+
+    function buildPolyline(series, color, dasharray) {
+      if (series.length < 2) return;
+      const points = series.map(([t, v]) => tx(t) + ',' + ty(v)).join(' ');
+      const attrs = {
+        points,
+        fill: 'none',
+        stroke: color,
+        'stroke-width': '2',
+        'stroke-linejoin': 'miter',
+        'stroke-linecap': 'square',
+        'clip-path': 'url(#' + clipId + ')',
+      };
+      if (dasharray) attrs['stroke-dasharray'] = dasharray;
+      svg.appendChild(makeSvgEl('polyline', attrs));
+    }
+
+    // Parse timestamps → epoch ms
+    function parseTS(s) {
+      // "2026-10-10T21:35:12"  (no TZ → treated as local)
+      return new Date(s).getTime();
+    }
+
+    const roomSeries  = pts.map(p => [parseTS(p.timestamp), p.room_temp]);
+    const acSeries    = pts.map(p => [parseTS(p.timestamp), p.ac_set_temp]);
+
+    // Target temp: horizontal dashed line across full width
+    const targetY = ty(targetTemp);
+    svg.appendChild(makeSvgEl('line', {
+      x1: PAD.left, y1: targetY, x2: W - PAD.right, y2: targetY,
+      stroke: '#16a34a', 'stroke-width': '2',
+      'stroke-dasharray': '7,4',
+      'clip-path': 'url(#' + clipId + ')',
+    }));
+
+    buildPolyline(acSeries,   '#f59e0b');
+    buildPolyline(roomSeries, '#2563eb');
+
+    // Axes borders
+    svg.appendChild(makeSvgEl('line', {
+      x1: PAD.left, y1: PAD.top, x2: PAD.left, y2: H - PAD.bottom,
+      stroke: '#cbd5e1', 'stroke-width': '1',
+    }));
+    svg.appendChild(makeSvgEl('line', {
+      x1: PAD.left, y1: H - PAD.bottom, x2: W - PAD.right, y2: H - PAD.bottom,
+      stroke: '#cbd5e1', 'stroke-width': '1',
+    }));
+  }
+
+  // Initial render
+  fetch('/api/chart').then(r => r.json()).then(renderChart).catch(() => {});
+
+  // Expose for the refresh loop
+  window._renderChart = renderChart;
+})();
+
+// ── Events table rebuilder ────────────────────────────────────────────────────
+function rebuildEventsTable(rows) {
+  const wrap = document.getElementById('events-wrap');
+  if (!wrap) return;
+  if (!rows || rows.length === 0) {
+    wrap.innerHTML = '<p style="color:#888;font-size:0.85rem">No changes logged yet.</p>';
+    return;
+  }
+  const cols = ['timestamp','room_temp','ac_set_temp','delta','ac_action','fan_action'];
+  const heads = ['Timestamp','Room °C','AC Set °C','Delta','AC Action','Fan Action'];
+  let html = '<table><thead><tr>' +
+    heads.map(h => '<th>' + h + '</th>').join('') +
+    '</tr></thead><tbody>';
+  for (const r of rows) {
+    html += '<tr>' + cols.map(c => '<td>' + (r[c] ?? '') + '</td>').join('') + '</tr>';
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+}
+
+// ── Countdown / auto-refresh loop ─────────────────────────────────────────────
 let countdown = 300;
 const countEl = document.getElementById('countdown');
 setInterval(() => {
@@ -678,6 +935,8 @@ setInterval(() => {
   if (countEl) countEl.textContent = countdown;
   if (countdown <= 0) {
     countdown = 300;
+
+    // Refresh status
     fetch('/api/status').then(r => r.json()).then(d => {
       const set = (id, v) => { const el = document.getElementById(id); if(el && v !== undefined) el.textContent = v; };
       set('room_temp',   d.room_temp   ?? '—');
@@ -693,12 +952,19 @@ setInterval(() => {
           el.className = 'value ' + (Math.abs(delta) < 0.3 ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
         }
       }
-    });
+    }).catch(() => {});
+
+    // Refresh chart
+    fetch('/api/chart').then(r => r.json()).then(window._renderChart).catch(() => {});
+
+    // Refresh events table
+    fetch('/api/events').then(r => r.json()).then(rebuildEventsTable).catch(() => {});
   }
 }, 1000);
 </script>
 </body></html>
 """
+
 
 
 _LOG_TEMPLATE = """
@@ -799,6 +1065,58 @@ def dashboard():
 def api_status():
     s = get_shared_state()
     return jsonify(s)
+
+
+@app.route("/api/chart")
+@login_required
+def api_chart():
+    """
+    Return chart data for the requested time window.
+
+    Query parameters (all optional, for future use):
+      span_hours    — window width in hours (default 24)
+      offset_periods — how many full windows to shift backwards (default 0 = live)
+
+    Response JSON:
+      {
+        "target_temp": <float>,
+        "points": [
+          {"timestamp": "ISO-string", "room_temp": <float>, "ac_set_temp": <float>},
+          …
+        ]
+      }
+    """
+    try:
+        span_hours = int(request.args.get("span_hours", 24))
+        offset_periods = int(request.args.get("offset_periods", 0))
+    except (ValueError, TypeError):
+        span_hours = 24
+        offset_periods = 0
+
+    rows = read_chart_rows(span_hours=span_hours, offset_periods=offset_periods)
+    points = [
+        {
+            "timestamp": r["timestamp"],
+            "room_temp": float(r["room_temp"]),
+            "ac_set_temp": float(r["ac_set_temp"]),
+        }
+        for r in rows
+    ]
+    return jsonify({
+        "target_temp": TARGET_ROOM_TEMP,
+        "span_hours": span_hours,
+        "offset_periods": offset_periods,
+        "points": points,
+    })
+
+
+@app.route("/api/events")
+@login_required
+def api_events():
+    """Return the most-recent event rows (changed=='yes') as JSON for live table refresh."""
+    rows = read_event_rows(max_rows=20)
+    return jsonify(rows)
+
 
 @app.route("/log")
 @login_required
