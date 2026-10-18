@@ -789,10 +789,10 @@ _DASHBOARD_TEMPLATE = """
     const tEnd   = Date.now();
     const tStart = tEnd - 24 * 60 * 60 * 1000;
 
-    // Value domain: auto from data + target, with a small padding
+    // Value domain: snap to whole degrees (floor min, ceil max), 1°C ticks
     const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp]).concat([targetTemp]);
-    const vMin = Math.min(...allVals) - 0.5;
-    const vMax = Math.max(...allVals) + 0.5;
+    const vMin = Math.floor(Math.min(...allVals));
+    const vMax = Math.ceil(Math.max(...allVals));
 
     const plotW = W - PAD.left - PAD.right;
     const plotH = H - PAD.top  - PAD.bottom;
@@ -804,11 +804,9 @@ _DASHBOARD_TEMPLATE = """
       return PAD.top + plotH - ((val - vMin) / (vMax - vMin)) * plotH;
     }
 
-    // ── Grid lines & Y-axis labels ─────────────────────────────────────────
-    const yTicks = 5;
-    for (let i = 0; i <= yTicks; i++) {
-      const val  = vMin + (vMax - vMin) * (i / yTicks);
-      const y    = ty(val);
+    // ── Grid lines & Y-axis labels (1°C per tick) ─────────────────────────
+    for (let val = vMin; val <= vMax; val++) {
+      const y = ty(val);
       // grid line
       svg.appendChild(makeSvgEl('line', {
         x1: PAD.left, y1: y, x2: W - PAD.right, y2: y,
@@ -819,7 +817,7 @@ _DASHBOARD_TEMPLATE = """
         x: PAD.left - 5, y: y + 4,
         'text-anchor': 'end', 'font-size': '11', fill: '#888',
       });
-      lbl.textContent = val.toFixed(1);
+      lbl.textContent = String(val);
       svg.appendChild(lbl);
     }
 
