@@ -821,23 +821,43 @@ _DASHBOARD_TEMPLATE = """
       svg.appendChild(lbl);
     }
 
-    // ── X-axis time labels (every 4 h) ────────────────────────────────────
-    for (let h = 0; h <= 24; h += 4) {
-      const epochMs = tEnd - (24 - h) * 3600 * 1000;
-      const x = tx(epochMs);
-      svg.appendChild(makeSvgEl('line', {
-        x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
-        stroke: '#e5e7eb', 'stroke-width': '1',
-      }));
-      const d = new Date(epochMs);
-      const label = d.getHours().toString().padStart(2, '0') + ':' +
-                    d.getMinutes().toString().padStart(2, '0');
-      const lbl = makeSvgEl('text', {
-        x: x, y: H - PAD.bottom + 14,
-        'text-anchor': 'middle', 'font-size': '11', fill: '#888',
-      });
-      lbl.textContent = label;
-      svg.appendChild(lbl);
+    // ── X-axis: snapped to real clock hours ───────────────────────────────
+    // Find the first even hour strictly after tStart
+    const tStartDate = new Date(tStart);
+    // Round up to the next whole hour, then snap to next even hour
+    let firstHour = new Date(tStartDate);
+    firstHour.setMinutes(0, 0, 0);
+    firstHour.setTime(firstHour.getTime() + 3600 * 1000); // advance to next whole hour
+    if (firstHour.getHours() % 2 !== 0) {
+      firstHour.setTime(firstHour.getTime() + 3600 * 1000); // bump to even
+    }
+
+    // Walk every hour from firstHour up to tEnd
+    for (let t = firstHour.getTime(); t < tEnd; t += 3600 * 1000) {
+      const x = tx(t);
+      const hr = new Date(t).getHours();
+      const isEven = (hr % 2 === 0);
+
+      if (isEven) {
+        // Full-height grid line
+        svg.appendChild(makeSvgEl('line', {
+          x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
+          stroke: '#e5e7eb', 'stroke-width': '1',
+        }));
+        // HH:00 label
+        const lbl = makeSvgEl('text', {
+          x: x, y: H - PAD.bottom + 14,
+          'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+        });
+        lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+        svg.appendChild(lbl);
+      } else {
+        // Short tick at the bottom of the plot area only — no grid line, no label
+        svg.appendChild(makeSvgEl('line', {
+          x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
+          stroke: '#cbd5e1', 'stroke-width': '1',
+        }));
+      }
     }
 
     // ── Clip rect so lines don't overflow plot area ───────────────────────
