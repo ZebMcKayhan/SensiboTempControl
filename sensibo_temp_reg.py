@@ -133,7 +133,17 @@ _log_lock = threading.Lock()
 LOG_FIELDS = ["timestamp", "room_temp", "ac_set_temp", "delta", "ac_action", "fan_action", "changed"]
 
 def _log_file_path() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_FILE)
+    # If explicit path exists, use it directly
+    if os.path.exists(LOG_FILE):
+        return LOG_FILE
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Check if a file with the same basename exists in the script directory
+    local_path = os.path.join(script_dir, os.path.basename(LOG_FILE))
+    if os.path.exists(local_path):
+        return local_path
+    if os.path.isabs(LOG_FILE):
+        return LOG_FILE
+    return os.path.join(script_dir, LOG_FILE)
 
 def append_log_row(row: dict):
     """Append one CSV row to the log file (thread-safe)."""
@@ -173,6 +183,146 @@ def read_event_rows(max_rows: int = 50) -> list[dict]:
         return list(reversed(rows[-max_rows:]))
     event_rows = [r for r in rows if r.get("changed") == "yes"]
     return list(reversed(event_rows[-max_rows:]))
+
+
+def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
+    """
+    Return chart points and metadata for the requested view and date.
+
+    Views:
+      - '24h': rolling 24 hours ending now
+      - 'day': single calendar day (00:00 to 24:00)
+      - 'week': Monday 00:00 to Sunday 24:00
+      - 'month': 1st of month 00:00 to last day of month 24:00
+    """
+    from datetime import timedelta
+    import calendar
+
+    today = datetime.now().date()
+    if date_str:
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            d = today
+    else:
+        d = today
+
+    now = datetime.now()
+    can_go_next = False
+
+    if view == "day":
+        start_dt = datetime(d.year, d.month, d.day, 0, 0, 0)
+        end_dt = datetime(d.year, d.month, d.day, 23, 59, 59)
+        label = d.strftime("%A, %d %b %Y")
+        can_go_next = (d < today)
+    elif view == "week":
+        # Monday is weekday 0
+        monday = d - timedelta(days=d.weekday())
+        sunday = monday + timedelta(days=6)
+        start_dt = datetime(monday.year, monday.month, monday.day, 0, 0, 0)
+        end_dt = datetime(sunday.year, sunday.month, sunday.day, 23, 59, 59)
+        iso_year, iso_week, _ = monday.isocalendar()
+        label = f"Week {iso_week}, {iso_year} ({monday.strftime('%d %b')} - {sunday.strftime('%d %b')})"
+        today_monday = today - timedelta(days=today.weekday())
+        can_go_next = (monday < today_monday)
+    elif view == "month":
+        last_day = calendar.monthrange(d.year, d.month)[1]
+        start_dt = datetime(d.year, d.month, 1, 0, 0, 0)
+        end_dt = datetime(d.year, d.month, last_day, 23, 59, 59)
+        label = d.strftime("%B %Y")
+        can_go_next = (d.year < today.year or (d.year == today.year and d.month < today.month))
+    else:  # "24h"
+        view = "24h"
+        end_dt = now
+        start_dt = now - timedelta(hours=24)
+        label = "Last 24 Hours"
+        can_go_next = False
+
+    path = _log_file_path()
+    if not os.path.exists(path):
+        return {
+            "target_temp": TARGET_ROOM_TEMP,
+            "view": view,
+            "date": d.strftime("%Y-%m-%d"),
+            "label": label,
+            "start_iso": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "end_iso": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "can_go_next": can_go_next,
+            "points": [],
+        }
+
+    with _log_lock:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+    # Filter rows in [start_dt, end_dt] with valid numeric temperatures
+    raw_points = []
+    for r in rows:
+        ts_str = r.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if not (start_dt <= ts <= end_dt):
+            continue
+        try:
+            rt = float(r["room_temp"])
+            ac = float(r["ac_set_temp"])
+        except (ValueError, KeyError):
+            continue
+        raw_points.append({"ts": ts, "room_temp": rt, "ac_set_temp": ac})
+
+    # Deduplicate by timestamp (last logged entry wins) and sort chronologically
+    deduped = {}
+    for pt in raw_points:
+        deduped[pt["ts"]] = pt
+    sorted_points = [deduped[k] for k in sorted(deduped.keys())]
+
+    # Downsampling for week and month if row count is large
+    if view == "week" and len(sorted_points) > 400:
+        bucket_seconds = 30 * 60  # 30-minute buckets (~336 points max per week)
+    elif view == "month" and len(sorted_points) > 500:
+        bucket_seconds = 2 * 3600  # 2-hour buckets (~372 points max per month)
+    else:
+        bucket_seconds = None
+
+    if bucket_seconds and sorted_points:
+        points = []
+        import itertools
+        def bucket_key(pt):
+            diff = (pt["ts"] - start_dt).total_seconds()
+            return int(diff // bucket_seconds)
+
+        for b_idx, group in itertools.groupby(sorted_points, key=bucket_key):
+            g_list = list(group)
+            avg_rt = round(sum(p["room_temp"] for p in g_list) / len(g_list), 1)
+            last_ac = g_list[-1]["ac_set_temp"]
+            b_ts = start_dt + timedelta(seconds=(b_idx + 0.5) * bucket_seconds)
+            points.append({
+                "timestamp": b_ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                "room_temp": avg_rt,
+                "ac_set_temp": last_ac,
+            })
+    else:
+        points = [
+            {
+                "timestamp": p["ts"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "room_temp": p["room_temp"],
+                "ac_set_temp": p["ac_set_temp"],
+            }
+            for p in sorted_points
+        ]
+
+    return {
+        "target_temp": TARGET_ROOM_TEMP,
+        "view": view,
+        "date": d.strftime("%Y-%m-%d"),
+        "label": label,
+        "start_iso": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "end_iso": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "can_go_next": can_go_next,
+        "points": points,
+    }
 
 
 def read_chart_rows(span_hours: int = 24, offset_periods: int = 0) -> list[dict]:
@@ -621,6 +771,37 @@ _DASHBOARD_TEMPLATE = """
   """ + _BASE_STYLE + """
   <style>
     /* Chart styles */
+    .chart-header {
+      display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem;
+    }
+    .chart-header h2 { margin-bottom: 0; }
+    .view-btn-group {
+      display: inline-flex; border-radius: 6px; overflow: hidden;
+      border: 1px solid #cbd5e1; background: #f8fafc;
+    }
+    .view-btn {
+      background: transparent; border: none; padding: 0.35rem 0.75rem;
+      font-size: 0.8rem; font-weight: 500; color: #475569; cursor: pointer;
+      border-right: 1px solid #cbd5e1; transition: background .15s, color .15s;
+    }
+    .view-btn:last-child { border-right: none; }
+    .view-btn:hover { background: #e2e8f0; }
+    .view-btn.active { background: #2563eb; color: #fff; }
+    .chart-nav {
+      display: flex; align-items: center; justify-content: center;
+      gap: 1rem; margin-bottom: 0.75rem; background: #f8fafc;
+      padding: 0.4rem 0.75rem; border-radius: 6px; border: 1px solid #e2e8f0;
+    }
+    .nav-btn {
+      background: #fff; border: 1px solid #cbd5e1; border-radius: 4px;
+      width: 28px; height: 28px; display: inline-flex; align-items: center;
+      justify-content: center; cursor: pointer; font-size: 1.1rem; line-height: 1;
+      color: #1e3a5f; transition: background .15s, border-color .15s;
+    }
+    .nav-btn:hover:not(:disabled) { background: #e2e8f0; border-color: #94a3b8; }
+    .nav-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .nav-title { font-size: 0.88rem; font-weight: 600; color: #1e3a5f; min-width: 220px; text-align: center; }
     .chart-wrap { position: relative; width: 100%; }
     .chart-wrap svg { width: 100%; height: 260px; display: block; overflow: visible; }
     .chart-legend {
@@ -630,7 +811,7 @@ _DASHBOARD_TEMPLATE = """
     .legend-item { display: flex; align-items: center; gap: 0.35rem; }
     .legend-swatch { width: 28px; height: 3px; border-radius: 2px; }
     .legend-dashed { border-top: 2px dashed; height: 0; width: 28px; }
-    .chart-empty { color: #aaa; font-size: 0.85rem; padding: 1rem 0; }
+    .chart-empty { color: #aaa; font-size: 0.85rem; padding: 1rem 0; text-align: center; }
   </style>
 </head>
 <body>
@@ -683,13 +864,26 @@ _DASHBOARD_TEMPLATE = """
     </p>
   </div>
 
-  <!-- 24 h Temperature Chart -->
+  <!-- Temperature Chart -->
   <div class="card">
-    <h2>Last 24 Hours</h2>
+    <div class="chart-header">
+      <h2 id="chartTitle">Last 24 Hours</h2>
+      <div class="view-btn-group">
+        <button type="button" class="view-btn active" data-view="24h">Last 24h</button>
+        <button type="button" class="view-btn" data-view="day">Day</button>
+        <button type="button" class="view-btn" data-view="week">Week</button>
+        <button type="button" class="view-btn" data-view="month">Month</button>
+      </div>
+    </div>
+    <div class="chart-nav" id="chartNav" style="display:none">
+      <button type="button" class="nav-btn" id="navPrev" title="Previous">‹</button>
+      <span class="nav-title" id="navTitle"></span>
+      <button type="button" class="nav-btn" id="navNext" title="Next">›</button>
+    </div>
     <div class="chart-wrap">
       <svg id="tempChart" viewBox="0 0 900 240" preserveAspectRatio="none"
-           aria-label="24-hour temperature chart"></svg>
-      <p class="chart-empty" id="chartEmpty" style="display:none">No data for the last 24 hours.</p>
+           aria-label="Temperature chart"></svg>
+      <p class="chart-empty" id="chartEmpty" style="display:none">No data for this period.</p>
     </div>
     <div class="chart-legend">
       <div class="legend-item">
@@ -756,11 +950,14 @@ _DASHBOARD_TEMPLATE = """
 </div>
 
 <script>
-// ── Chart renderer ────────────────────────────────────────────────────────────
+// ── Chart renderer & Time-Window Controller ──────────────────────────────────
 (function () {
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const W = 900, H = 240;
   const PAD = { top: 14, right: 16, bottom: 36, left: 44 };
+
+  let currentView = '24h';
+  let currentDate = new Date();
 
   function makeSvgEl(tag, attrs) {
     const el = document.createElementNS(SVG_NS, tag);
@@ -768,36 +965,119 @@ _DASHBOARD_TEMPLATE = """
     return el;
   }
 
+  function formatIsoDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function getMonday(d) {
+    const dt = new Date(d);
+    const day = dt.getDay(); // 0 is Sun, 1 is Mon
+    const diff = dt.getDate() - day + (day === 0 ? -6 : 1);
+    return new Date(dt.getFullYear(), dt.getMonth(), diff);
+  }
+
+  function updateViewButtons() {
+    document.querySelectorAll('.view-btn').forEach(btn => {
+      if (btn.dataset.view === currentView) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
+    });
+  }
+
+  function setView(newView) {
+    if (newView === currentView) return;
+    const oldView = currentView;
+    currentView = newView;
+
+    if (newView === '24h') {
+      currentDate = new Date();
+    } else if (newView === 'day') {
+      if (oldView === '24h') {
+        currentDate = new Date();
+      } else if (oldView === 'week') {
+        currentDate = getMonday(currentDate);
+      } else if (oldView === 'month') {
+        currentDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+      }
+    } else if (newView === 'week') {
+      if (oldView === '24h') {
+        currentDate = new Date();
+      } else if (oldView === 'day') {
+        // Keep currentDate (the week that day is a part of)
+      } else if (oldView === 'month') {
+        currentDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+      }
+    } else if (newView === 'month') {
+      if (oldView === '24h') {
+        currentDate = new Date();
+      } else if (oldView === 'day') {
+        // Keep currentDate (month that day is part of)
+      } else if (oldView === 'week') {
+        currentDate = getMonday(currentDate);
+      }
+    }
+
+    updateViewButtons();
+    loadChart();
+  }
+
+  function navigate(step) {
+    if (currentView === 'day') {
+      currentDate.setDate(currentDate.getDate() + step);
+    } else if (currentView === 'week') {
+      currentDate.setDate(currentDate.getDate() + (step * 7));
+    } else if (currentView === 'month') {
+      currentDate = new Date(currentDate.getFullYear(), currentDate.getMonth() + step, 1);
+    }
+    loadChart();
+  }
+
   function renderChart(data) {
     const svg = document.getElementById('tempChart');
     const emptyMsg = document.getElementById('chartEmpty');
-    // Clear previous content
+
     while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-    if (!data || !data.points || data.points.length === 0) {
-      svg.style.display = 'none';
+    const pts = (data && data.points) ? data.points : [];
+    const targetTemp = (data && data.target_temp !== undefined) ? data.target_temp : 22.8;
+    const view = (data && data.view) ? data.view : currentView;
+
+    if (pts.length === 0) {
       emptyMsg.style.display = '';
-      return;
+    } else {
+      emptyMsg.style.display = 'none';
     }
     svg.style.display = '';
-    emptyMsg.style.display = 'none';
 
-    const pts = data.points;
-    const targetTemp = data.target_temp;
-
-    // Time domain: fixed 24 h window ending "now"
-    const tEnd   = Date.now();
-    const tStart = tEnd - 24 * 60 * 60 * 1000;
+    // Parse start and end timestamps into local epoch ms
+    const tStart = data.start_iso ? new Date(data.start_iso).getTime() : (Date.now() - 24 * 3600 * 1000);
+    const tEnd   = data.end_iso   ? new Date(data.end_iso).getTime()   : Date.now();
 
     // Value domain: snap to whole degrees (floor min, ceil max), 1°C ticks
-    const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp]).concat([targetTemp]);
-    const vMin = Math.floor(Math.min(...allVals));
-    const vMax = Math.ceil(Math.max(...allVals));
+    let vMin, vMax;
+    if (pts.length > 0) {
+      const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp]).concat([targetTemp]);
+      vMin = Math.floor(Math.min(...allVals));
+      vMax = Math.ceil(Math.max(...allVals));
+    } else {
+      vMin = Math.floor(targetTemp - 2);
+      vMax = Math.ceil(targetTemp + 2);
+    }
+    if (vMin === vMax) {
+      vMin -= 1;
+      vMax += 1;
+    }
 
     const plotW = W - PAD.left - PAD.right;
     const plotH = H - PAD.top  - PAD.bottom;
 
     function tx(epochMs) {
+      if (tEnd <= tStart) return PAD.left;
       return PAD.left + ((epochMs - tStart) / (tEnd - tStart)) * plotW;
     }
     function ty(val) {
@@ -807,12 +1087,10 @@ _DASHBOARD_TEMPLATE = """
     // ── Grid lines & Y-axis labels (1°C per tick) ─────────────────────────
     for (let val = vMin; val <= vMax; val++) {
       const y = ty(val);
-      // grid line
       svg.appendChild(makeSvgEl('line', {
         x1: PAD.left, y1: y, x2: W - PAD.right, y2: y,
         stroke: '#e5e7eb', 'stroke-width': '1',
       }));
-      // label
       const lbl = makeSvgEl('text', {
         x: PAD.left - 5, y: y + 4,
         'text-anchor': 'end', 'font-size': '11', fill: '#888',
@@ -821,42 +1099,117 @@ _DASHBOARD_TEMPLATE = """
       svg.appendChild(lbl);
     }
 
-    // ── X-axis: snapped to real clock hours ───────────────────────────────
-    // Find the first even hour strictly after tStart
-    const tStartDate = new Date(tStart);
-    // Round up to the next whole hour, then snap to next even hour
-    let firstHour = new Date(tStartDate);
-    firstHour.setMinutes(0, 0, 0);
-    firstHour.setTime(firstHour.getTime() + 3600 * 1000); // advance to next whole hour
-    if (firstHour.getHours() % 2 !== 0) {
-      firstHour.setTime(firstHour.getTime() + 3600 * 1000); // bump to even
-    }
-
-    // Walk every hour from firstHour up to tEnd
-    for (let t = firstHour.getTime(); t < tEnd; t += 3600 * 1000) {
-      const x = tx(t);
-      const hr = new Date(t).getHours();
-      const isEven = (hr % 2 === 0);
-
-      if (isEven) {
-        // Full-height grid line
+    // ── X-axis ticks & grid lines per view ─────────────────────────────────
+    if (view === '24h') {
+      const tStartDate = new Date(tStart);
+      let firstHour = new Date(tStartDate);
+      firstHour.setMinutes(0, 0, 0, 0);
+      firstHour.setTime(firstHour.getTime() + 3600 * 1000);
+      if (firstHour.getHours() % 2 !== 0) {
+        firstHour.setTime(firstHour.getTime() + 3600 * 1000);
+      }
+      for (let t = firstHour.getTime(); t < tEnd; t += 3600 * 1000) {
+        const x = tx(t);
+        const hr = new Date(t).getHours();
+        const isEven = (hr % 2 === 0);
+        if (isEven) {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H - PAD.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+          svg.appendChild(lbl);
+        } else {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
+      }
+    } else if (view === 'day') {
+      // 00:00 to 24:00 (24 hours)
+      for (let hr = 0; hr <= 24; hr++) {
+        const t = tStart + hr * 3600 * 1000;
+        const x = tx(t);
+        const isEven = (hr % 2 === 0);
+        if (isEven) {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H - PAD.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+          svg.appendChild(lbl);
+        } else {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
+      }
+    } else if (view === 'week') {
+      // Monday 00:00 to Sunday 24:00 (7 days)
+      const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      for (let i = 0; i < 7; i++) {
+        const dayStart = tStart + i * 24 * 3600 * 1000;
+        const x = tx(dayStart);
+        // Major tick: 00:00 every day
         svg.appendChild(makeSvgEl('line', {
           x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
           stroke: '#e5e7eb', 'stroke-width': '1',
         }));
-        // HH:00 label
+        const dDate = new Date(dayStart);
         const lbl = makeSvgEl('text', {
-          x: x, y: H - PAD.bottom + 14,
-          'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          x: x + 4, y: H - PAD.bottom + 14,
+          'text-anchor': 'start', 'font-size': '11', fill: '#888',
         });
-        lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+        lbl.textContent = dayNames[i] + ' ' + dDate.getDate();
         svg.appendChild(lbl);
-      } else {
-        // Short tick at the bottom of the plot area only — no grid line, no label
+
+        // Minor tick: 12:00 noon every day
+        const noon = dayStart + 12 * 3600 * 1000;
+        const noonX = tx(noon);
         svg.appendChild(makeSvgEl('line', {
-          x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
+          x1: noonX, y1: H - PAD.bottom, x2: noonX, y2: H - PAD.bottom + 4,
           stroke: '#cbd5e1', 'stroke-width': '1',
         }));
+      }
+    } else if (view === 'month') {
+      // 1st 00:00 to last day 24:00
+      const mStart = new Date(tStart);
+      const year = mStart.getFullYear();
+      const month = mStart.getMonth();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dTime = new Date(year, month, d).getTime();
+        const x = tx(dTime);
+        if (d % 2 === 0) {
+          // Major tick: even days at 00:00
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H - PAD.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = String(d);
+          svg.appendChild(lbl);
+        } else {
+          // Minor tick: odd days at 00:00
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
       }
     }
 
@@ -870,30 +1223,49 @@ _DASHBOARD_TEMPLATE = """
     defs.appendChild(clip);
     svg.appendChild(defs);
 
-    function buildPolyline(series, color, dasharray) {
-      if (series.length < 2) return;
-      const points = series.map(([t, v]) => tx(t) + ',' + ty(v)).join(' ');
-      const attrs = {
-        points,
-        fill: 'none',
-        stroke: color,
-        'stroke-width': '2',
-        'stroke-linejoin': 'miter',
-        'stroke-linecap': 'square',
-        'clip-path': 'url(#' + clipId + ')',
-      };
-      if (dasharray) attrs['stroke-dasharray'] = dasharray;
-      svg.appendChild(makeSvgEl('polyline', attrs));
+    // Segmented polyline builder (breaks across missing data gaps)
+    function buildPolylineSegments(series, color, dasharray, maxGapMs) {
+      if (series.length < 1) return;
+
+      const chunks = [];
+      let curChunk = [series[0]];
+      for (let i = 1; i < series.length; i++) {
+        if (series[i][0] - series[i - 1][0] > maxGapMs) {
+          chunks.push(curChunk);
+          curChunk = [];
+        }
+        curChunk.push(series[i]);
+      }
+      if (curChunk.length > 0) chunks.push(curChunk);
+
+      for (const chunk of chunks) {
+        if (chunk.length === 1) {
+          const [t, v] = chunk[0];
+          svg.appendChild(makeSvgEl('circle', {
+            cx: tx(t), cy: ty(v), r: '2.5',
+            fill: color,
+            'clip-path': 'url(#' + clipId + ')',
+          }));
+          continue;
+        }
+        const pointsStr = chunk.map(([t, v]) => tx(t).toFixed(1) + ',' + ty(v).toFixed(1)).join(' ');
+        const attrs = {
+          points: pointsStr,
+          fill: 'none',
+          stroke: color,
+          'stroke-width': '2',
+          'stroke-linejoin': 'miter',
+          'stroke-linecap': 'square',
+          'clip-path': 'url(#' + clipId + ')',
+        };
+        if (dasharray) attrs['stroke-dasharray'] = dasharray;
+        svg.appendChild(makeSvgEl('polyline', attrs));
+      }
     }
 
-    // Parse timestamps → epoch ms
     function parseTS(s) {
-      // "2026-10-10T21:35:12"  (no TZ → treated as local)
       return new Date(s).getTime();
     }
-
-    const roomSeries  = pts.map(p => [parseTS(p.timestamp), p.room_temp]);
-    const acSeries    = pts.map(p => [parseTS(p.timestamp), p.ac_set_temp]);
 
     // Target temp: horizontal dashed line across full width
     const targetY = ty(targetTemp);
@@ -904,8 +1276,17 @@ _DASHBOARD_TEMPLATE = """
       'clip-path': 'url(#' + clipId + ')',
     }));
 
-    buildPolyline(acSeries,   '#f59e0b');
-    buildPolyline(roomSeries, '#2563eb');
+    if (pts.length > 0) {
+      const roomSeries = pts.map(p => [parseTS(p.timestamp), p.room_temp]);
+      const acSeries   = pts.map(p => [parseTS(p.timestamp), p.ac_set_temp]);
+
+      let maxGapMs = 30 * 60 * 1000;
+      if (view === 'week') maxGapMs = 2 * 3600 * 1000;
+      if (view === 'month') maxGapMs = 6 * 3600 * 1000;
+
+      buildPolylineSegments(acSeries,   '#f59e0b', null, maxGapMs);
+      buildPolylineSegments(roomSeries, '#2563eb', null, maxGapMs);
+    }
 
     // Axes borders
     svg.appendChild(makeSvgEl('line', {
@@ -918,11 +1299,43 @@ _DASHBOARD_TEMPLATE = """
     }));
   }
 
-  // Initial render
-  fetch('/api/chart').then(r => r.json()).then(renderChart).catch(() => {});
+  function loadChart() {
+    const url = `/api/chart?view=${currentView}&date=${formatIsoDate(currentDate)}`;
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        const chartNav = document.getElementById('chartNav');
+        const navTitle = document.getElementById('navTitle');
+        const navNext = document.getElementById('navNext');
+        const chartTitle = document.getElementById('chartTitle');
 
-  // Expose for the refresh loop
-  window._renderChart = renderChart;
+        if (currentView === '24h') {
+          chartNav.style.display = 'none';
+          chartTitle.textContent = 'Last 24 Hours';
+        } else {
+          chartNav.style.display = 'flex';
+          chartTitle.textContent = currentView.charAt(0).toUpperCase() + currentView.slice(1);
+          navTitle.textContent = data.label || '';
+          navNext.disabled = !data.can_go_next;
+        }
+
+        renderChart(data);
+      })
+      .catch(() => {});
+  }
+
+  // Button handlers
+  document.querySelectorAll('.view-btn').forEach(btn => {
+    btn.addEventListener('click', () => setView(btn.dataset.view));
+  });
+  document.getElementById('navPrev').addEventListener('click', () => navigate(-1));
+  document.getElementById('navNext').addEventListener('click', () => navigate(1));
+
+  // Initial load
+  loadChart();
+
+  // Expose loadChart for auto-refresh
+  window._loadChart = loadChart;
 })();
 
 // ── Events table rebuilder ────────────────────────────────────────────────────
@@ -972,8 +1385,8 @@ setInterval(() => {
       }
     }).catch(() => {});
 
-    // Refresh chart
-    fetch('/api/chart').then(r => r.json()).then(window._renderChart).catch(() => {});
+    // Refresh chart (maintains currently selected view and date)
+    if (window._loadChart) window._loadChart();
 
     // Refresh events table
     fetch('/api/events').then(r => r.json()).then(rebuildEventsTable).catch(() => {});
@@ -1091,41 +1504,23 @@ def api_chart():
     """
     Return chart data for the requested time window.
 
-    Query parameters (all optional, for future use):
-      span_hours    — window width in hours (default 24)
-      offset_periods — how many full windows to shift backwards (default 0 = live)
-
-    Response JSON:
-      {
-        "target_temp": <float>,
-        "points": [
-          {"timestamp": "ISO-string", "room_temp": <float>, "ac_set_temp": <float>},
-          …
-        ]
-      }
+    Query parameters:
+      view — '24h' (default), 'day', 'week', 'month'
+      date — 'YYYY-MM-DD' anchor date (default: today)
     """
-    try:
-        span_hours = int(request.args.get("span_hours", 24))
-        offset_periods = int(request.args.get("offset_periods", 0))
-    except (ValueError, TypeError):
-        span_hours = 24
-        offset_periods = 0
+    view = request.args.get("view", "").strip().lower()
+    if not view:
+        # Fallback if span_hours was supplied
+        if request.args.get("span_hours"):
+            view = "24h"
+        else:
+            view = "24h"
+    elif view not in ("24h", "day", "week", "month"):
+        view = "24h"
 
-    rows = read_chart_rows(span_hours=span_hours, offset_periods=offset_periods)
-    points = [
-        {
-            "timestamp": r["timestamp"],
-            "room_temp": float(r["room_temp"]),
-            "ac_set_temp": float(r["ac_set_temp"]),
-        }
-        for r in rows
-    ]
-    return jsonify({
-        "target_temp": TARGET_ROOM_TEMP,
-        "span_hours": span_hours,
-        "offset_periods": offset_periods,
-        "points": points,
-    })
+    date_str = request.args.get("date")
+    data = read_chart_data(view=view, date_str=date_str)
+    return jsonify(data)
 
 
 @app.route("/api/events")
