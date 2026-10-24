@@ -90,7 +90,7 @@ SensiboTempReg/
 
 ```powershell
 # If you have git:
-git clone <your-repo-url> SensiboTempReg
+git clone https://github.com/ZebMcKayhan/SensiboTempControl SensiboTempReg
 cd SensiboTempReg
 
 # Or just download sensibo_temp_reg.py and requirements.txt into a folder.
