@@ -746,8 +746,9 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
         "Regulation loop started. Read every %d min, Fast min %d min, Slow min %d min.",
         READ_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES, 2 * CHECK_INTERVAL_MINUTES,
     )
-    last_fast_change_time: float = 0.0   # epoch seconds of last fast set-point change
-    last_slow_change_time: float = 0.0   # epoch seconds of last slow set-point change
+    now_startup = time.time()
+    last_fast_change_time: float = now_startup   # active from startup to block changes for first CHECK_INTERVAL_MINUTES
+    last_slow_change_time: float = now_startup   # active from startup to block changes for first 2 * CHECK_INTERVAL_MINUTES
 
     while True:
         now_epoch = time.time()
@@ -780,12 +781,7 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
         set_temp_after = state_after.get("ac_set_temp")
 
         now_done = time.time()
-        # On startup (first run), state_before had no ac_set_temp (set_temp_before is None).
-        # We preserve existing startup behavior where rate limit cooldown is initiated on startup:
-        if set_temp_before is None:
-            last_fast_change_time = now_done
-            last_slow_change_time = now_done
-        elif changed and set_temp_after != set_temp_before:
+        if changed and set_temp_after != set_temp_before:
             if regulator_source == "slow":
                 last_slow_change_time = now_done
                 last_fast_change_time = now_done
