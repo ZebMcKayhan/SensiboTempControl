@@ -21,20 +21,25 @@ Every 30 minutes (configurable) the script:
 1. **Reads** the room temperature from the Sensibo pod's sensor (at desk/sofa height).
 2. **Reads** the AC's current set-point and fan speed via the Sensibo API.
 3. **Compares** the measured room temperature to your `TARGET_ROOM_TEMP`.
-4. **Adjusts** the AC set-point by ±1 °C if the room is too cold or too warm:
-
-```
-room_temp < TARGET − 0.5 °C  →  AC set-point +1 °C  (room too cold)
-room_temp > TARGET + 0.6 °C  →  AC set-point −1 °C  (room too warm)
-otherwise                    →  no change
-```
+4. **Adjusts** the AC set-point by ±1 °C using a dual-regulator approach:
+   - **Fast regulator** (instantaneous):
+     ```
+     room_temp < TARGET − FAST_THRESHOLD  →  AC set-point +1 °C  (room too cold)
+     room_temp > TARGET + FAST_THRESHOLD  →  AC set-point −1 °C  (room too warm)
+     ```
+   - **Slow regulator** (EMA integrator, evaluated only when fast regulator is satisfied and not rate-limited):
+     ```
+     AvgTemp < TARGET − SLOW_THRESHOLD  →  AC set-point +1 °C
+     AvgTemp > TARGET + SLOW_THRESHOLD  →  AC set-point −1 °C
+     ```
+   - Otherwise → no change.
 
 5. **Adjusts fan speed** based on the (possibly updated) AC set-point using your fan-speed table.
 6. **Logs** every cycle to a file and updates the web dashboard.
 
 ### Key design decisions
 
-- **Stateless** — each cycle reads fresh data from the API and makes decisions purely on current readings. Nothing is stored between cycles.
+- **Dual-regulator control** — combines a fast regulator for immediate threshold excursions with an in-memory EMA filter for subtle long-term temperature drift, while keeping the on-disk log format clean and consistent.
 - **Heat-mode only** — the script does nothing if the AC is off or in any mode other than `heat`.
 - **Safe limits** — the AC set-point is never pushed below `AC_TEMP_MIN` (20 °C) or above `AC_TEMP_MAX` (27 °C).
 - **Fan speed is optional** — if the current AC set-point does not appear in your fan-speed table, the fan is left exactly as it is.
@@ -117,8 +122,9 @@ SENSIBO_DEVICE_ID = ""          # leave blank on first run (see below)
 TARGET_ROOM_TEMP = 22           # °C — increase to 23 in deep winter if needed
 
 # ── Regulation thresholds ─────────────────────────────────────────────────────
-UNDERSHOOT_THRESHOLD = 0.5      # °C below target → increase AC set-point by 1
-OVERSHOOT_THRESHOLD  = 0.6      # °C above target → decrease AC set-point by 1
+FAST_THRESHOLD = 0.4            # °C deviation from target (±) to trigger fast regulator
+SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) to trigger slow regulator
+SLOW_TAU       = 180            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
 AC_TEMP_MIN = 20                # °C — never set AC below this
@@ -195,7 +201,7 @@ or `http://localhost:8080` if you are on the same machine. Log in with the usern
 
 The dashboard shows:
 
-- **Current status** — room temperature, target, AC set-point, fan speed, mode, last checked time
+- **Current status** — room temperature, average temperature (EMA), target, AC set-point, fan speed, mode, last checked time
 - **Delta indicator** — colour-coded: 🔵 room too cold / 🟢 within range / 🔴 room too warm
 - **Recent events** — last 20 regulation cycles
 - **Configuration** — read-only display of all your settings

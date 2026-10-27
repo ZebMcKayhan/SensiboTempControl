@@ -32,8 +32,9 @@ SENSIBO_DEVICE_ID = ""          # leave blank → interactive device picker on s
 TARGET_ROOM_TEMP = 22.8          # °C  — adjust seasonally (e.g. 23 in deep winter)
 
 # ── Regulation thresholds ─────────────────────────────────────────────────────
-UNDERSHOOT_THRESHOLD = 0.4      # °C below target → increase AC set-point by 1
-OVERSHOOT_THRESHOLD  = 0.4      # °C above target → decrease AC set-point by 1
+FAST_THRESHOLD = 0.4            # °C deviation from target (±) for fast regulator
+SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) for slow regulator
+SLOW_TAU       = 180            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
 AC_TEMP_MIN = 20                # °C — never set AC below this
@@ -77,6 +78,7 @@ LOG_FILE = "/var/log/sensibo/sensibo_reg.log"   # relative to script directory; 
 
 import csv
 import io
+import math
 import os
 import sys
 import time
@@ -127,6 +129,32 @@ def get_shared_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# EMA temperature filter (integrator)
+# ---------------------------------------------------------------------------
+_ema_lock = threading.Lock()
+_ema_avg_temp: float | None = None
+_last_sample_epoch: float | None = None
+
+def update_ema_filter(room_temp: float, now_epoch: float) -> float:
+    """
+    Integrates room temperature into the exponential moving average (EMA) filter:
+      AvgTemp = Temp * ALPHA + AvgTemp * (1 - ALPHA)
+      ALPHA = 1 - exp(-duration_min / SLOW_TAU)
+    On startup / first sample, ALPHA = 1 so AvgTemp is initialized to room_temp.
+    """
+    global _ema_avg_temp, _last_sample_epoch
+    with _ema_lock:
+        if _ema_avg_temp is None or _last_sample_epoch is None:
+            _ema_avg_temp = float(room_temp)
+        else:
+            duration_min = max(0.0, (now_epoch - _last_sample_epoch) / 60.0)
+            alpha = 1.0 - math.exp(-duration_min / SLOW_TAU)
+            _ema_avg_temp = room_temp * alpha + _ema_avg_temp * (1.0 - alpha)
+        _last_sample_epoch = now_epoch
+        return _ema_avg_temp
+
+
+# ---------------------------------------------------------------------------
 # Log file helpers
 # ---------------------------------------------------------------------------
 _log_lock = threading.Lock()
@@ -148,6 +176,9 @@ def _log_file_path() -> str:
 def append_log_row(row: dict):
     """Append one CSV row to the log file (thread-safe)."""
     path = _log_file_path()
+    log_dir = os.path.dirname(path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     write_header = not os.path.exists(path)
     with _log_lock:
         with open(path, "a", newline="", encoding="utf-8") as f:
@@ -477,23 +508,118 @@ class SensiboClient:
 # Regulation loop
 # ---------------------------------------------------------------------------
 
-def regulate(client: SensiboClient, device_id: str, allow_ac_change: bool) -> None:
+def apply_ac_change(
+    client: SensiboClient,
+    device_id: str,
+    ac_state: dict,
+    current_ac_temp: int,
+    direction: int,
+    current_fan: str,
+) -> tuple[int, str, str, bool]:
     """
-    Regulation cycle.  Reads current state from the Sensibo API, decides
-    whether to adjust AC set-point and/or fan speed, applies any changes in a
-    single API call, and appends a log row.
+    Applies an AC set-point adjustment (+1 or -1), enforces AC_TEMP_MIN/MAX limits,
+    looks up fan speed from FAN_SPEED_TABLE, and sends a single combined API call if needed.
 
-    *allow_ac_change* controls whether the AC set-point may be modified this
-    cycle.  Even when False the sensor data is still read and logged so the
-    dashboard stays current.
+    Returns:
+        (new_ac_temp, ac_action, fan_action, changed)
+    """
+    if direction > 0:
+        new_temp = min(current_ac_temp + 1, AC_TEMP_MAX)
+        if new_temp != current_ac_temp:
+            desired_temp = new_temp
+            ac_action = f"Increased set-point to {new_temp}°C"
+        else:
+            log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", AC_TEMP_MAX)
+            ac_action = f"At max limit ({AC_TEMP_MAX}°C), no increase"
+            desired_temp = current_ac_temp
+    else:
+        new_temp = max(current_ac_temp - 1, AC_TEMP_MIN)
+        if new_temp != current_ac_temp:
+            desired_temp = new_temp
+            ac_action = f"Decreased set-point to {new_temp}°C"
+        else:
+            log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", AC_TEMP_MIN)
+            ac_action = f"At min limit ({AC_TEMP_MIN}°C), no decrease"
+            desired_temp = current_ac_temp
+
+    desired_fan = None
+    target_set_for_fan = desired_temp
+    if target_set_for_fan in FAN_SPEED_TABLE:
+        target_fan_int = FAN_SPEED_TABLE[target_set_for_fan]
+        target_fan_str = INT_TO_FAN.get(target_fan_int)
+        if target_fan_str is None:
+            log.warning("Fan speed integer %d has no API mapping, skipping", target_fan_int)
+            fan_action = f"Invalid fan speed int {target_fan_int}"
+        elif current_fan != target_fan_str:
+            desired_fan = target_fan_str
+            fan_action = f"Fan → {target_fan_int} ({target_fan_str})"
+        else:
+            fan_action = f"Fan unchanged ({target_fan_int})"
+    else:
+        fan_action = f"Fan unchanged (no table entry for {target_set_for_fan}°C)"
+        log.info("No fan table entry for set-point %d°C, fan left as-is", target_set_for_fan)
+
+    temp_changed = desired_temp != current_ac_temp
+    fan_changed = desired_fan is not None
+    changed = False
+
+    if temp_changed or fan_changed:
+        updates: dict = {}
+        if temp_changed:
+            updates["targetTemperature"] = desired_temp
+            log.info(
+                "Set-point %s: %d → %d°C",
+                "increased" if desired_temp > current_ac_temp else "decreased",
+                current_ac_temp, desired_temp,
+            )
+        if fan_changed:
+            updates["fanLevel"] = desired_fan
+            log.info("Fan speed → %s", desired_fan)
+
+        if temp_changed and fan_changed:
+            client.set_ac_state_fields(device_id, ac_state, updates)
+        elif temp_changed:
+            client.set_ac_state_field(device_id, "targetTemperature", desired_temp)
+        else:
+            client.set_ac_state_field(device_id, "fanLevel", desired_fan)
+
+        if temp_changed:
+            current_ac_temp = desired_temp
+        if fan_changed:
+            update_shared_state(ac_fan=desired_fan, ac_set_temp=current_ac_temp)
+        else:
+            update_shared_state(ac_set_temp=current_ac_temp)
+
+        changed = True
+
+    return current_ac_temp, ac_action, fan_action, changed
+
+
+def regulate(
+    client: SensiboClient,
+    device_id: str,
+    fast_rate_limited: bool,
+    slow_rate_limited: bool,
+) -> tuple[bool, str | None]:
+    """
+    Regulation cycle. Reads current state from the Sensibo API, updates
+    the EMA temperature filter, evaluates the fast regulator and (if fast is happy
+    and not rate-limited) evaluates the slow regulator. Applies any changes
+    in a single API call and appends a log row.
+
+    Returns:
+        (changed, regulator_source) where regulator_source is 'fast', 'slow', or None.
     """
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    now_epoch = time.time()
     ac_action = "Error"
     fan_action = "Error"
     room_temp = None
+    avg_temp = None
     ac_set_temp = None
     delta = None
-    changed = False   # True when any AC/fan command was actually sent
+    changed = False
+    regulator_source: str | None = None
 
     try:
         # 1. Read current AC state and room measurement (single API call)
@@ -512,8 +638,12 @@ def regulate(client: SensiboClient, device_id: str, allow_ac_change: bool) -> No
         if ac_set_temp is None:
             raise SensiboError("No targetTemperature in AC state")
 
+        # All samples integrated in EMA filter, even during rate-limits or when AC is off
+        avg_temp = update_ema_filter(room_temp, now_epoch)
+
         update_shared_state(
             room_temp=room_temp,
+            avg_temp=round(avg_temp, 2),
             ac_set_temp=ac_set_temp,
             ac_mode=ac_mode,
             ac_on=ac_on,
@@ -529,97 +659,70 @@ def regulate(client: SensiboClient, device_id: str, allow_ac_change: bool) -> No
             fan_action = "Skipped"
             delta = None
         else:
-            # 3. Temperature regulation
+            # 3. Dual temperature regulation
             delta = round(room_temp - TARGET_ROOM_TEMP, 2)
             log.info(
-                "Room: %.1f°C  Target: %.1f°C  AC set: %d°C  Delta: %+.2f°C%s",
-                room_temp, TARGET_ROOM_TEMP, ac_set_temp, delta,
-                "" if allow_ac_change else "  [set-point locked — rate limit]",
+                "Room: %.1f°C  Avg: %.2f°C  Target: %.1f°C  AC set: %d°C  Delta: %+.2f°C",
+                room_temp, avg_temp, TARGET_ROOM_TEMP, ac_set_temp, delta,
             )
 
-            # Decide desired new set-point (may be same as current)
-            desired_temp = ac_set_temp
-            if allow_ac_change:
-                if delta < -UNDERSHOOT_THRESHOLD:
-                    new_temp = min(ac_set_temp + 1, AC_TEMP_MAX)
-                    if new_temp != ac_set_temp:
-                        desired_temp = new_temp
-                        ac_action = f"Increased set-point to {new_temp}°C"
-                    else:
-                        log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", AC_TEMP_MAX)
-                        ac_action = f"At max limit ({AC_TEMP_MAX}°C), no increase"
-                elif delta > OVERSHOOT_THRESHOLD:
-                    new_temp = max(ac_set_temp - 1, AC_TEMP_MIN)
-                    if new_temp != ac_set_temp:
-                        desired_temp = new_temp
-                        ac_action = f"Decreased set-point to {new_temp}°C"
-                    else:
-                        log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", AC_TEMP_MIN)
-                        ac_action = f"At min limit ({AC_TEMP_MIN}°C), no decrease"
-                else:
-                    ac_action = "No change"
-            else:
-                ac_action = "No change (rate limited)"
+            # Determine fast regulator trigger
+            fast_direction = 0
+            if delta < -FAST_THRESHOLD:
+                fast_direction = 1
+            elif delta > FAST_THRESHOLD:
+                fast_direction = -1
 
-            # 4. Determine desired fan speed
-            desired_fan = None   # None means "no fan change needed"
-            target_set_for_fan = desired_temp   # use the new set-point for fan lookup
-            if target_set_for_fan in FAN_SPEED_TABLE:
-                target_fan_int = FAN_SPEED_TABLE[target_set_for_fan]
-                target_fan_str = INT_TO_FAN.get(target_fan_int)
-                if target_fan_str is None:
-                    log.warning("Fan speed integer %d has no API mapping, skipping", target_fan_int)
-                    fan_action = f"Invalid fan speed int {target_fan_int}"
-                elif ac_fan != target_fan_str:
-                    desired_fan = target_fan_str
-                    fan_action = f"Fan → {target_fan_int} ({target_fan_str})"
-                else:
-                    fan_action = f"Fan unchanged ({target_fan_int})"
-            else:
-                fan_action = f"Fan unchanged (no table entry for {target_set_for_fan}°C)"
-                log.info("No fan table entry for set-point %d°C, fan left as-is", target_set_for_fan)
-
-            # 5. Apply changes — combine into a single API call if possible
-            temp_changed = desired_temp != ac_set_temp
-            fan_changed  = desired_fan is not None
-
-            if temp_changed or fan_changed:
-                updates: dict = {}
-                if temp_changed:
-                    updates["targetTemperature"] = desired_temp
+            if fast_direction != 0:
+                if fast_rate_limited:
+                    ac_action = "No change (rate limited)"
+                    fan_action = "Fan unchanged"
                     log.info(
-                        "Set-point %s: %d → %d°C",
-                        "increased" if desired_temp > ac_set_temp else "decreased",
-                        ac_set_temp, desired_temp,
+                        "Fast regulator wants %s but is rate-limited",
+                        "increase" if fast_direction > 0 else "decrease",
                     )
-                if fan_changed:
-                    updates["fanLevel"] = desired_fan
-                    log.info("Fan speed → %s", desired_fan)
-
-                if temp_changed and fan_changed:
-                    # Single combined call — avoids double beep
-                    client.set_ac_state_fields(device_id, ac_state, updates)
-                elif temp_changed:
-                    client.set_ac_state_field(device_id, "targetTemperature", desired_temp)
                 else:
-                    client.set_ac_state_field(device_id, "fanLevel", desired_fan)
-
-                # Update shared state to reflect applied changes
-                if temp_changed:
-                    ac_set_temp = desired_temp
-                if fan_changed:
-                    update_shared_state(ac_fan=desired_fan, ac_set_temp=ac_set_temp)
+                    regulator_source = "fast"
+                    ac_set_temp, ac_action, fan_action, changed = apply_ac_change(
+                        client, device_id, ac_state, ac_set_temp, fast_direction, ac_fan
+                    )
+            else:
+                # Fast regulator is happy with no change
+                if fast_rate_limited:
+                    ac_action = "No change (rate limited)"
+                    fan_action = "Fan unchanged"
+                    log.info("Fast regulator is happy, but fast rate-limit is active — slow regulator skipped")
                 else:
-                    update_shared_state(ac_set_temp=ac_set_temp)
+                    # Fast is happy and not rate-limited -> evaluate slow regulator
+                    slow_direction = 0
+                    if avg_temp < TARGET_ROOM_TEMP - SLOW_THRESHOLD:
+                        slow_direction = 1
+                    elif avg_temp > TARGET_ROOM_TEMP + SLOW_THRESHOLD:
+                        slow_direction = -1
 
-                changed = True
+                    if slow_direction != 0:
+                        if slow_rate_limited:
+                            ac_action = "No change (rate limited)"
+                            fan_action = "Fan unchanged"
+                            log.info(
+                                "Slow regulator wants %s but is rate-limited",
+                                "increase" if slow_direction > 0 else "decrease",
+                            )
+                        else:
+                            regulator_source = "slow"
+                            ac_set_temp, ac_action, fan_action, changed = apply_ac_change(
+                                client, device_id, ac_state, ac_set_temp, slow_direction, ac_fan
+                            )
+                    else:
+                        ac_action = "No change"
+                        fan_action = "Fan unchanged"
 
     except SensiboError as exc:
         log.error("Regulation cycle failed: %s", exc)
         ac_action = f"API Error: {exc}"
         fan_action = "N/A"
 
-    # 6. Append log row (every cycle so log is complete)
+    # 4. Append log row (every cycle so log is complete)
     append_log_row({
         "timestamp": now,
         "room_temp": f"{room_temp:.1f}" if room_temp is not None else "N/A",
@@ -630,38 +733,65 @@ def regulate(client: SensiboClient, device_id: str, allow_ac_change: bool) -> No
         "changed": "yes" if changed else "no",
     })
 
+    return changed, regulator_source
+
 
 def regulation_loop(client: SensiboClient, device_id: str) -> None:
     """
-    Background thread: poll the sensor every READ_INTERVAL_MINUTES but only
-    allow AC set-point changes once per CHECK_INTERVAL_MINUTES.
+    Background thread: poll sensor every READ_INTERVAL_MINUTES.
+    Fast regulator enforces CHECK_INTERVAL_MINUTES cooldown.
+    Slow regulator enforces 2 * CHECK_INTERVAL_MINUTES cooldown.
     """
     log.info(
-        "Regulation loop started. Read every %d min, AC changes every %d min.",
-        READ_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES,
+        "Regulation loop started. Read every %d min, Fast min %d min, Slow min %d min.",
+        READ_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES, 2 * CHECK_INTERVAL_MINUTES,
     )
-    last_ac_change_time: float = 0.0   # epoch seconds of last set-point change
+    last_fast_change_time: float = 0.0   # epoch seconds of last fast set-point change
+    last_slow_change_time: float = 0.0   # epoch seconds of last slow set-point change
 
     while True:
         now_epoch = time.time()
-        minutes_since_last = (now_epoch - last_ac_change_time) / 60.0
-        allow_ac_change = minutes_since_last >= CHECK_INTERVAL_MINUTES
+        fast_elapsed = (now_epoch - last_fast_change_time) / 60.0
+        slow_elapsed = (now_epoch - last_slow_change_time) / 60.0
+
+        fast_rate_limited = fast_elapsed < CHECK_INTERVAL_MINUTES
+        slow_rate_limited = slow_elapsed < (2 * CHECK_INTERVAL_MINUTES)
+
+        fast_status = "allowed" if not fast_rate_limited else f"locked {CHECK_INTERVAL_MINUTES - fast_elapsed:.0f}m"
+        slow_status = "allowed" if not slow_rate_limited else f"locked {2 * CHECK_INTERVAL_MINUTES - slow_elapsed:.0f}m"
 
         log.info(
-            "--- Regulation cycle start (AC change %s) ---",
-            "allowed" if allow_ac_change else f"locked for {CHECK_INTERVAL_MINUTES - minutes_since_last:.0f} more min",
+            "--- Regulation cycle start [Fast: %s, Slow: %s] ---",
+            fast_status, slow_status,
         )
 
         # Remember set-point before the cycle to detect if it was changed
         state_before = get_shared_state()
         set_temp_before = state_before.get("ac_set_temp")
 
-        regulate(client, device_id, allow_ac_change=allow_ac_change)
+        changed, regulator_source = regulate(
+            client,
+            device_id,
+            fast_rate_limited=fast_rate_limited,
+            slow_rate_limited=slow_rate_limited,
+        )
 
         state_after = get_shared_state()
         set_temp_after = state_after.get("ac_set_temp")
-        if set_temp_after != set_temp_before:
-            last_ac_change_time = time.time()
+
+        now_done = time.time()
+        # On startup (first run), state_before had no ac_set_temp (set_temp_before is None).
+        # We preserve existing startup behavior where rate limit cooldown is initiated on startup:
+        if set_temp_before is None:
+            last_fast_change_time = now_done
+            last_slow_change_time = now_done
+        elif changed and set_temp_after != set_temp_before:
+            if regulator_source == "slow":
+                last_slow_change_time = now_done
+                last_fast_change_time = now_done
+            elif regulator_source == "fast":
+                last_fast_change_time = now_done
+                # Fast regulator does not reset slow regulator rate limit
 
         log.info("--- Next read in %d min ---", READ_INTERVAL_MINUTES)
         time.sleep(READ_INTERVAL_MINUTES * 60)
@@ -831,6 +961,11 @@ _DASHBOARD_TEMPLATE = """
         <div class="unit">°C</div>
       </div>
       <div class="stat">
+        <div class="label">Average Temp</div>
+        <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
+        <div class="unit">°C</div>
+      </div>
+      <div class="stat">
         <div class="label">Target Temp</div>
         <div class="value">{{ target }}</div>
         <div class="unit">°C</div>
@@ -936,8 +1071,9 @@ _DASHBOARD_TEMPLATE = """
     <table class="config-table">
       <tbody>
         <tr><td>TARGET_ROOM_TEMP</td><td>{{ target }} °C</td></tr>
-        <tr><td>UNDERSHOOT_THRESHOLD</td><td>{{ cfg.UNDERSHOOT_THRESHOLD }} °C</td></tr>
-        <tr><td>OVERSHOOT_THRESHOLD</td><td>{{ cfg.OVERSHOOT_THRESHOLD }} °C</td></tr>
+        <tr><td>FAST_THRESHOLD</td><td>{{ cfg.FAST_THRESHOLD }} °C (± threshold for fast regulator)</td></tr>
+        <tr><td>SLOW_THRESHOLD</td><td>{{ cfg.SLOW_THRESHOLD }} °C (± threshold for slow regulator)</td></tr>
+        <tr><td>SLOW_TAU</td><td>{{ cfg.SLOW_TAU }} min (EMA filter time constant)</td></tr>
         <tr><td>AC_TEMP_MIN</td><td>{{ cfg.AC_TEMP_MIN }} °C</td></tr>
         <tr><td>AC_TEMP_MAX</td><td>{{ cfg.AC_TEMP_MAX }} °C</td></tr>
         <tr><td>READ_INTERVAL_MINUTES</td><td>{{ cfg.READ_INTERVAL_MINUTES }} min (sensor polling)</td></tr>
@@ -1371,6 +1507,7 @@ setInterval(() => {
     fetch('/api/status').then(r => r.json()).then(d => {
       const set = (id, v) => { const el = document.getElementById(id); if(el && v !== undefined) el.textContent = v; };
       set('room_temp',   d.room_temp   ?? '—');
+      set('avg_temp',    (d.avg_temp !== undefined && d.avg_temp !== null) ? Number(d.avg_temp).toFixed(2) : '—');
       set('ac_set_temp', d.ac_set_temp ?? '—');
       set('ac_fan',      d.ac_fan      ?? '—');
       set('ac_mode',     d.ac_mode     ?? '—');
@@ -1380,7 +1517,7 @@ setInterval(() => {
         const el = document.getElementById('delta');
         if (el) {
           el.textContent = (delta >= 0 ? '+' : '') + delta;
-          el.className = 'value ' + (Math.abs(delta) < 0.3 ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
+          el.className = 'value ' + (Math.abs(delta) < {{ cfg.FAST_THRESHOLD }} ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
         }
       }
     }).catch(() => {});
@@ -1468,9 +1605,9 @@ def dashboard():
     delta_class = "delta-ok"
     if s.get("room_temp") and s["room_temp"] != "N/A":
         delta = float(s["room_temp"]) - TARGET_ROOM_TEMP
-        if delta < -UNDERSHOOT_THRESHOLD:
+        if delta < -FAST_THRESHOLD:
             delta_class = "delta-cold"
-        elif delta > OVERSHOOT_THRESHOLD:
+        elif delta > FAST_THRESHOLD:
             delta_class = "delta-warm"
 
     return render_template_string(
@@ -1480,8 +1617,9 @@ def dashboard():
         target=TARGET_ROOM_TEMP,
         delta_class=delta_class,
         cfg={
-            "UNDERSHOOT_THRESHOLD": UNDERSHOOT_THRESHOLD,
-            "OVERSHOOT_THRESHOLD": OVERSHOOT_THRESHOLD,
+            "FAST_THRESHOLD": FAST_THRESHOLD,
+            "SLOW_THRESHOLD": SLOW_THRESHOLD,
+            "SLOW_TAU": SLOW_TAU,
             "AC_TEMP_MIN": AC_TEMP_MIN,
             "AC_TEMP_MAX": AC_TEMP_MAX,
             "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
