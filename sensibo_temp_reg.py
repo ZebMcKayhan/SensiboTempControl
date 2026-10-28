@@ -34,7 +34,7 @@ TARGET_ROOM_TEMP = 22.8          # °C  — adjust seasonally (e.g. 23 in deep w
 # ── Regulation thresholds ─────────────────────────────────────────────────────
 FAST_THRESHOLD = 0.4            # °C deviation from target (±) for fast regulator
 SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) for slow regulator
-SLOW_TAU       = 180            # minutes — EMA filter time constant
+SLOW_TAU       = 120            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
 AC_TEMP_MIN = 20                # °C — never set AC below this
