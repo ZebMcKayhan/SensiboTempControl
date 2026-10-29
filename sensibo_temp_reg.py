@@ -747,7 +747,7 @@ class SensiboClient:
                     dev_id = chosen["id"]
                     name = chosen.get("room", {}).get("name", "Unknown")
                     print(f"\nUsing: {name} ({dev_id})")
-                    print(f"Tip: set SENSIBO_DEVICE_ID = \"{dev_id}\" in the config to skip this step next time.\n")
+                    print(f"SENSIBO_DEVICE_ID = \"{dev_id}\" will be added to the config file.\n")
                     return dev_id
             except ValueError:
                 pass
