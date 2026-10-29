@@ -66,10 +66,11 @@ Example: when the AC is told to heat to 24 °C (needing to work harder), the fan
 
 ```
 SensiboTempReg/
-├── sensibo_temp_reg.py   ← single script, all logic inside
-├── requirements.txt      ← Python dependencies
-├── README.md             ← this file
-└── sensibo_reg.log       ← created automatically on first run
+├── sensibo_temp_reg.py          ← main regulator script and web server
+├── sensibo_temp_reg_setting.json ← persistent configuration file (created automatically)
+├── requirements.txt             ← Python dependencies
+├── README.md                    ← this file
+└── sensibo_reg.log              ← created automatically on first run
 ```
 
 ---
@@ -111,48 +112,44 @@ This installs `flask` and `requests`. Both are small and have no heavy dependenc
 
 ### 4. Configure the script
 
-Open `sensibo_temp_reg.py` in any text editor. All settings are at the **very top of the file** between the two `===` banners — you will not need to touch anything else.
+Configuration settings are stored in `sensibo_temp_reg_setting.json` in the same directory. If the file does not exist when starting `sensibo_temp_reg.py`, it is automatically created using the built-in defaults from the script.
 
-```python
-# ── Sensibo API ───────────────────────────────────────────────────────────────
-SENSIBO_API_KEY   = "paste_your_api_key_here"
-SENSIBO_DEVICE_ID = ""          # leave blank on first run (see below)
+You can set your `SENSIBO_API_KEY` in `sensibo_temp_reg_setting.json`:
 
-# ── Target room temperature ───────────────────────────────────────────────────
-TARGET_ROOM_TEMP = 22           # °C — increase to 23 in deep winter if needed
-
-# ── Regulation thresholds ─────────────────────────────────────────────────────
-FAST_THRESHOLD = 0.4            # °C deviation from target (±) to trigger fast regulator
-SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) to trigger slow regulator
-SLOW_TAU       = 180            # minutes — EMA filter time constant
-
-# ── AC set-point limits ───────────────────────────────────────────────────────
-AC_TEMP_MIN = 20                # °C — never set AC below this
-AC_TEMP_MAX = 27                # °C — never set AC above this
-
-# ── Fan-speed table  (AC set-point → fan speed 1–6) ─────────────────────────
-FAN_SPEED_TABLE = {
-    20: 2,
-    21: 2,
-    22: 2,
-    23: 3,
-    24: 4,
-    25: 5,
-    26: 6,
+```json
+{
+  "SENSIBO_API_KEY": "YOUR_API_KEY_HERE",
+  "SENSIBO_DEVICE_ID": "",
+  "ROOM_TEMP_OFFSET": -0.4,
+  "TARGET_ROOM_TEMP": 22.8,
+  "FAST_THRESHOLD": 0.4,
+  "SLOW_THRESHOLD": 0.2,
+  "SLOW_TAU": 120,
+  "AC_TEMP_MIN": 20,
+  "AC_TEMP_MAX": 27,
+  "FAN_SPEED_TABLE": {
+    "20": 4,
+    "21": 4,
+    "22": 5,
+    "23": 5,
+    "24": 6,
+    "25": 6,
+    "26": 6
+  },
+  "READ_INTERVAL_MINUTES": 5,
+  "CHECK_INTERVAL_MINUTES": 30,
+  "WEB_HOST": "0.0.0.0",
+  "WEB_PORT": 8585,
+  "WEB_USERNAME": "admin",
+  "WEB_PASSWORD": "changeme",
+  "SESSION_SECRET_KEY": "change-this-to-a-random-string",
+  "LOG_FILE": "/var/log/sensibo/sensibo_reg.log"
 }
-
-# ── Polling ───────────────────────────────────────────────────────────────────
-CHECK_INTERVAL_MINUTES = 30
-
-# ── Web server ────────────────────────────────────────────────────────────────
-WEB_HOST     = "0.0.0.0"
-WEB_PORT     = 8080
-WEB_USERNAME = "admin"
-WEB_PASSWORD = "changeme"       # ← change this!
-SESSION_SECRET_KEY = "change-this-to-a-random-string"  # any random text
 ```
 
-> **Tip:** `SESSION_SECRET_KEY` is used to sign login cookies. Set it to any long random string — it just needs to be consistent while the script is running.
+- **`ROOM_TEMP_OFFSET`** (`-0.4` °C): The Sensibo sensor often reads ~0.4 °C too high. This offset is applied immediately to the raw reading (`adjusted_room_temp = sensibo_room_temp + ROOM_TEMP_OFFSET`) and used across all regulators, filters, and displays.
+- **`TARGET_ROOM_TEMP`**: Can also be adjusted directly from the web dashboard using the `↑` and `↓` buttons in 0.1 °C increments.
+- **Defaults & updates**: The Python script retains default values. If future script updates introduce new parameters, missing keys in your existing JSON file are automatically populated with defaults while fully preserving your existing custom settings.
 
 ---
 
@@ -172,10 +169,10 @@ If `SENSIBO_DEVICE_ID` is blank, the script queries your account and lets you ch
 Select device [1-1]: 1
 
 Using: Living Room (abCdeFg)
-Tip: set SENSIBO_DEVICE_ID = "abCdeFg" in the config to skip this step next time.
+Device ID 'abCdeFg' saved to sensibo_temp_reg_setting.json
 ```
 
-Paste the printed ID into `SENSIBO_DEVICE_ID` in the config so you won't be prompted again.
+The chosen device ID is automatically saved to `sensibo_temp_reg_setting.json` so you will not be prompted again on subsequent runs.
 
 ### Console output
 
@@ -201,13 +198,13 @@ or `http://localhost:8080` if you are on the same machine. Log in with the usern
 
 The dashboard shows:
 
-- **Current status** — room temperature, average temperature (EMA), target, AC set-point, fan speed, mode, last checked time
+- **Current status** — room temperature, average temperature (EMA), target (with `↑` and `↓` buttons to adjust target temperature in 0.1 °C steps), AC set-point, fan speed, mode, last checked time
 - **Delta indicator** — colour-coded: 🔵 room too cold / 🟢 within range / 🔴 room too warm
 - **Recent events** — last 20 regulation cycles
-- **Configuration** — read-only display of all your settings
+- **Configuration** — display of settings loaded from `sensibo_temp_reg_setting.json`
 - **Full log** — available at `/log`, shows up to 500 historical entries
 
-The status card refreshes automatically every 60 seconds.
+The status card refreshes automatically every 300 seconds (or immediately when adjusting target temperature).
 
 ---
 
@@ -243,7 +240,7 @@ The main setting you will want to adjust as seasons change is `TARGET_ROOM_TEMP`
 
 You can also tune `FAN_SPEED_TABLE` if you find the fan is too loud or too quiet at certain set-points.
 
-After any config change, restart the script for the new settings to take effect.
+Target temperature adjustments made through the GUI take effect immediately without restarting the service and persist across restarts. For other manual edits in `sensibo_temp_reg_setting.json`, restart the script for the new settings to take effect.
 
 ---
 

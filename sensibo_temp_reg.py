@@ -21,7 +21,9 @@ a device from your account.
 # ██║     ██║   ██║██║╚██╗██║██╔══╝  ██║██║   ██║
 # ╚██████╗╚██████╔╝██║ ╚████║██║     ██║╚██████╔╝
 #  ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝
-# Edit all your settings here — nowhere else needed.
+# Default configuration settings.
+# Active settings are loaded from and persisted to sensibo_temp_reg_setting.json.
+# These values serve as initial defaults and fallbacks for missing parameters.
 # =============================================================================
 
 # ── Sensibo API ───────────────────────────────────────────────────────────────
@@ -29,7 +31,8 @@ SENSIBO_API_KEY   = "YOUR_API_KEY_HERE"
 SENSIBO_DEVICE_ID = ""          # leave blank → interactive device picker on startup
 
 # ── Target room temperature ───────────────────────────────────────────────────
-TARGET_ROOM_TEMP = 22.8          # °C  — adjust seasonally (e.g. 23 in deep winter)
+ROOM_TEMP_OFFSET = -0.4          # °C  — room sensor offset (reads ~0.4°C too high)
+TARGET_ROOM_TEMP = 22.4          # °C  — adjust seasonally (e.g. 23 in deep winter)
 
 # ── Regulation thresholds ─────────────────────────────────────────────────────
 FAST_THRESHOLD = 0.4            # °C deviation from target (±) for fast regulator
@@ -37,8 +40,8 @@ SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) 
 SLOW_TAU       = 120            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
-AC_TEMP_MIN = 20                # °C — never set AC below this
-AC_TEMP_MAX = 27                # °C — never set AC above this
+AC_TEMP_MIN = 20                # 8-30 °C — never set AC below this
+AC_TEMP_MAX = 27                # 8-30 °C — never set AC above this
 
 # ── Fan-speed table  (AC set-point [°C] → fan speed integer 1–6) ─────────────
 # Only temperatures listed here will trigger a fan-speed change.
@@ -73,14 +76,17 @@ SESSION_SECRET_KEY = "change-this-to-a-random-string"  # used to sign session co
 LOG_FILE = "/var/log/sensibo/sensibo_reg.log"   # relative to script directory; created automatically
 
 # =============================================================================
-# END OF CONFIG — do not edit below unless you know what you're doing
+# END OF CONFIG DEFAULTS
 # =============================================================================
 
+import copy
 import csv
 import io
+import json
 import math
 import os
 import sys
+import tempfile
 import time
 import threading
 import logging
@@ -102,6 +108,247 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("sensibo_reg")
+
+# ---------------------------------------------------------------------------
+# Central Configuration Management
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "SENSIBO_API_KEY": SENSIBO_API_KEY,
+    "SENSIBO_DEVICE_ID": SENSIBO_DEVICE_ID,
+    "ROOM_TEMP_OFFSET": ROOM_TEMP_OFFSET,
+    "TARGET_ROOM_TEMP": TARGET_ROOM_TEMP,
+    "FAST_THRESHOLD": FAST_THRESHOLD,
+    "SLOW_THRESHOLD": SLOW_THRESHOLD,
+    "SLOW_TAU": SLOW_TAU,
+    "AC_TEMP_MIN": AC_TEMP_MIN,
+    "AC_TEMP_MAX": AC_TEMP_MAX,
+    "FAN_SPEED_TABLE": FAN_SPEED_TABLE,
+    "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
+    "CHECK_INTERVAL_MINUTES": CHECK_INTERVAL_MINUTES,
+    "WEB_HOST": WEB_HOST,
+    "WEB_PORT": WEB_PORT,
+    "WEB_USERNAME": WEB_USERNAME,
+    "WEB_PASSWORD": WEB_PASSWORD,
+    "SESSION_SECRET_KEY": SESSION_SECRET_KEY,
+    "LOG_FILE": LOG_FILE,
+}
+
+CONFIG_FILENAME = "sensibo_temp_reg_setting.json"
+
+class ConfigurationError(Exception):
+    """Raised when the configuration file is invalid, corrupted, or unreadable."""
+    pass
+
+class ConfigManager:
+    """
+    Central runtime configuration manager.
+    Maintains one active configuration used by the running script, thread-safely,
+    and persists updates atomically to sensibo_temp_reg_setting.json.
+    """
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self._lock = threading.Lock()
+        self._config: dict = {}
+        self._initialize()
+
+    def _atomic_write(self, data: dict) -> None:
+        """Safely write data to a temporary file and atomically replace target."""
+        dir_name = os.path.dirname(self.config_path) or "."
+        os.makedirs(dir_name, exist_ok=True)
+        serializable_data = {}
+        for k, v in data.items():
+            if k == "FAN_SPEED_TABLE" and isinstance(v, dict):
+                serializable_data[k] = {str(fk): fv for fk, fv in v.items()}
+            else:
+                serializable_data[k] = v
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="sensibo_cfg_",
+            suffix=".tmp",
+            dir=dir_name,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(serializable_data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    def _normalize(self, raw_cfg: dict) -> dict:
+        """Normalize types (e.g. FAN_SPEED_TABLE keys to int, numbers to float/int)."""
+        cfg = dict(raw_cfg)
+        if "FAN_SPEED_TABLE" in cfg and isinstance(cfg["FAN_SPEED_TABLE"], dict):
+            cfg["FAN_SPEED_TABLE"] = {int(k): int(v) for k, v in cfg["FAN_SPEED_TABLE"].items()}
+        if "TARGET_ROOM_TEMP" in cfg:
+            cfg["TARGET_ROOM_TEMP"] = round(float(cfg["TARGET_ROOM_TEMP"]), 1)
+        if "ROOM_TEMP_OFFSET" in cfg:
+            cfg["ROOM_TEMP_OFFSET"] = round(float(cfg["ROOM_TEMP_OFFSET"]), 2)
+        if "FAST_THRESHOLD" in cfg:
+            cfg["FAST_THRESHOLD"] = round(float(cfg["FAST_THRESHOLD"]), 2)
+        if "SLOW_THRESHOLD" in cfg:
+            cfg["SLOW_THRESHOLD"] = round(float(cfg["SLOW_THRESHOLD"]), 2)
+        if "SLOW_TAU" in cfg:
+            cfg["SLOW_TAU"] = int(cfg["SLOW_TAU"])
+        if "AC_TEMP_MIN" in cfg:
+            cfg["AC_TEMP_MIN"] = int(cfg["AC_TEMP_MIN"])
+        if "AC_TEMP_MAX" in cfg:
+            cfg["AC_TEMP_MAX"] = int(cfg["AC_TEMP_MAX"])
+        if "READ_INTERVAL_MINUTES" in cfg:
+            cfg["READ_INTERVAL_MINUTES"] = int(cfg["READ_INTERVAL_MINUTES"])
+        if "CHECK_INTERVAL_MINUTES" in cfg:
+            cfg["CHECK_INTERVAL_MINUTES"] = int(cfg["CHECK_INTERVAL_MINUTES"])
+        if "WEB_PORT" in cfg:
+            cfg["WEB_PORT"] = int(cfg["WEB_PORT"])
+        return cfg
+
+    def _validate(self, cfg: dict) -> None:
+        """Validate configuration values before applying or saving."""
+        ac_min = cfg.get("AC_TEMP_MIN")
+        ac_max = cfg.get("AC_TEMP_MAX")
+        if not isinstance(ac_min, (int, float)) or not isinstance(ac_max, (int, float)):
+            raise ValueError("AC_TEMP_MIN and AC_TEMP_MAX must be numeric.")
+        if ac_min >= ac_max:
+            raise ValueError(f"AC_TEMP_MIN ({ac_min}) must be less than AC_TEMP_MAX ({ac_max}).")
+
+        target = cfg.get("TARGET_ROOM_TEMP")
+        if not isinstance(target, (int, float)):
+            raise ValueError("TARGET_ROOM_TEMP must be numeric.")
+        if target < ac_min or target > ac_max:
+            raise ValueError(
+                f"TARGET_ROOM_TEMP ({target}°C) must be between AC_TEMP_MIN ({ac_min}°C) and AC_TEMP_MAX ({ac_max}°C)."
+            )
+
+        offset = cfg.get("ROOM_TEMP_OFFSET")
+        if not isinstance(offset, (int, float)):
+            raise ValueError("ROOM_TEMP_OFFSET must be numeric.")
+
+        for param in ("FAST_THRESHOLD", "SLOW_THRESHOLD", "SLOW_TAU", "READ_INTERVAL_MINUTES", "CHECK_INTERVAL_MINUTES"):
+            val = cfg.get(param)
+            if not isinstance(val, (int, float)) or val <= 0:
+                raise ValueError(f"{param} must be a positive number.")
+
+        fan_table = cfg.get("FAN_SPEED_TABLE")
+        if not isinstance(fan_table, dict):
+            raise ValueError("FAN_SPEED_TABLE must be a dictionary.")
+        for temp_k, speed_v in fan_table.items():
+            if not isinstance(temp_k, int) or not isinstance(speed_v, int):
+                raise ValueError("FAN_SPEED_TABLE keys and values must be integers.")
+            if speed_v not in range(1, 7):
+                raise ValueError(f"Invalid fan speed {speed_v} for temp {temp_k}; must be 1-6.")
+
+        port = cfg.get("WEB_PORT")
+        if not isinstance(port, int) or not (1 <= port <= 65535):
+            raise ValueError(f"WEB_PORT must be an integer between 1 and 65535.")
+
+    def _initialize(self) -> None:
+        """
+        Load configuration from disk, creating default or filling missing keys as needed.
+        """
+        with self._lock:
+            if not os.path.exists(self.config_path):
+                log.info("Configuration file '%s' not found. Creating with default settings.", self.config_path)
+                default_data = copy.deepcopy(DEFAULT_CONFIG)
+                self._validate(default_data)
+                self._atomic_write(default_data)
+                self._config = self._normalize(default_data)
+                return
+
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception as exc:
+                log.error("Failed to read configuration file '%s': %s", self.config_path, exc)
+                raise ConfigurationError(
+                    f"Configuration file '{self.config_path}' is invalid or cannot be read: {exc}"
+                ) from exc
+
+            if not isinstance(loaded, dict):
+                raise ConfigurationError(
+                    f"Configuration file '{self.config_path}' must contain a JSON object, got {type(loaded).__name__}."
+                )
+
+            # Check for missing parameters and fill them from defaults
+            missing_keys = [k for k in DEFAULT_CONFIG if k not in loaded]
+            if missing_keys:
+                log.info(
+                    "Populating missing configuration parameters from defaults in '%s': %s",
+                    self.config_path, ", ".join(missing_keys),
+                )
+                for k in missing_keys:
+                    loaded[k] = copy.deepcopy(DEFAULT_CONFIG[k])
+
+            normalized = self._normalize(loaded)
+            self._validate(normalized)
+
+            # If there were missing parameters, persist the completed configuration back to file
+            if missing_keys:
+                self._atomic_write(normalized)
+
+            self._config = normalized
+            log.info("Configuration loaded successfully from '%s'.", self.config_path)
+
+    def get(self, key: str, default=None):
+        with self._lock:
+            return self._config.get(key, default)
+
+    def get_all(self) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._config)
+
+    def update_config(self, updates: dict) -> dict:
+        """
+        Thread-safely update configuration parameters.
+        Validates candidate, saves atomically to disk, and updates active config.
+        """
+        with self._lock:
+            candidate = copy.deepcopy(self._config)
+            for k, v in updates.items():
+                candidate[k] = v
+            normalized = self._normalize(candidate)
+            self._validate(normalized)
+            self._atomic_write(normalized)
+            self._config = normalized
+            log.info("Active configuration updated and saved: %s", list(updates.keys()))
+            return copy.deepcopy(self._config)
+
+    def adjust_target_temp(self, delta: float) -> float:
+        """Adjust TARGET_ROOM_TEMP by delta (e.g. +0.1 or -0.1) atomically."""
+        with self._lock:
+            cur_target = self._config.get("TARGET_ROOM_TEMP", 22.8)
+            new_target = round(cur_target + delta, 1)
+            min_temp = self._config.get("AC_TEMP_MIN", 20)
+            max_temp = self._config.get("AC_TEMP_MAX", 27)
+            if new_target < min_temp or new_target > max_temp:
+                raise ValueError(
+                    f"Target temperature {new_target:.1f}°C is outside limits ({min_temp}°C - {max_temp}°C)"
+                )
+            candidate = copy.deepcopy(self._config)
+            candidate["TARGET_ROOM_TEMP"] = new_target
+            normalized = self._normalize(candidate)
+            self._validate(normalized)
+            self._atomic_write(normalized)
+            self._config = normalized
+            log.info("Target room temperature adjusted to %.1f°C", new_target)
+            return new_target
+
+# Initialize central config manager using path in the script directory
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE_PATH = os.path.join(_script_dir, CONFIG_FILENAME)
+try:
+    config_manager = ConfigManager(CONFIG_FILE_PATH)
+except ConfigurationError as _cfg_exc:
+    log.critical("FATAL: Failed to load configuration: %s", _cfg_exc)
+    print(f"\nFATAL CONFIGURATION ERROR: {_cfg_exc}\n", file=sys.stderr)
+    sys.exit(1)
 
 # Map integer fan speeds to Sensibo API string values
 INT_TO_FAN = {
@@ -143,12 +390,13 @@ def update_ema_filter(room_temp: float, now_epoch: float) -> float:
     On startup / first sample, ALPHA = 1 so AvgTemp is initialized to room_temp.
     """
     global _ema_avg_temp, _last_sample_epoch
+    slow_tau = config_manager.get("SLOW_TAU", 120)
     with _ema_lock:
         if _ema_avg_temp is None or _last_sample_epoch is None:
             _ema_avg_temp = float(room_temp)
         else:
             duration_min = max(0.0, (now_epoch - _last_sample_epoch) / 60.0)
-            alpha = 1.0 - math.exp(-duration_min / SLOW_TAU)
+            alpha = 1.0 - math.exp(-duration_min / slow_tau)
             _ema_avg_temp = room_temp * alpha + _ema_avg_temp * (1.0 - alpha)
         _last_sample_epoch = now_epoch
         return _ema_avg_temp
@@ -161,17 +409,18 @@ _log_lock = threading.Lock()
 LOG_FIELDS = ["timestamp", "room_temp", "ac_set_temp", "delta", "ac_action", "fan_action", "changed"]
 
 def _log_file_path() -> str:
+    log_file = config_manager.get("LOG_FILE", "/var/log/sensibo/sensibo_reg.log")
     # If explicit path exists, use it directly
-    if os.path.exists(LOG_FILE):
-        return LOG_FILE
+    if os.path.exists(log_file):
+        return log_file
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Check if a file with the same basename exists in the script directory
-    local_path = os.path.join(script_dir, os.path.basename(LOG_FILE))
+    local_path = os.path.join(script_dir, os.path.basename(log_file))
     if os.path.exists(local_path):
         return local_path
-    if os.path.isabs(LOG_FILE):
-        return LOG_FILE
-    return os.path.join(script_dir, LOG_FILE)
+    if os.path.isabs(log_file):
+        return log_file
+    return os.path.join(script_dir, log_file)
 
 def append_log_row(row: dict):
     """Append one CSV row to the log file (thread-safe)."""
@@ -270,9 +519,10 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
         can_go_next = False
 
     path = _log_file_path()
+    target_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
     if not os.path.exists(path):
         return {
-            "target_temp": TARGET_ROOM_TEMP,
+            "target_temp": target_temp,
             "view": view,
             "date": d.strftime("%Y-%m-%d"),
             "label": label,
@@ -345,7 +595,7 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
         ]
 
     return {
-        "target_temp": TARGET_ROOM_TEMP,
+        "target_temp": target_temp,
         "view": view,
         "date": d.strftime("%Y-%m-%d"),
         "label": label,
@@ -497,7 +747,7 @@ class SensiboClient:
                     dev_id = chosen["id"]
                     name = chosen.get("room", {}).get("name", "Unknown")
                     print(f"\nUsing: {name} ({dev_id})")
-                    print(f"Tip: set SENSIBO_DEVICE_ID = \"{dev_id}\" in the config to skip this step next time.\n")
+                    print(f"SENSIBO_DEVICE_ID = \"{dev_id}\" will be added to the config file.\n")
                     return dev_id
             except ValueError:
                 pass
@@ -523,29 +773,33 @@ def apply_ac_change(
     Returns:
         (new_ac_temp, ac_action, fan_action, changed)
     """
+    ac_min = config_manager.get("AC_TEMP_MIN", AC_TEMP_MIN)
+    ac_max = config_manager.get("AC_TEMP_MAX", AC_TEMP_MAX)
+    fan_speed_table = config_manager.get("FAN_SPEED_TABLE", FAN_SPEED_TABLE)
+
     if direction > 0:
-        new_temp = min(current_ac_temp + 1, AC_TEMP_MAX)
+        new_temp = min(current_ac_temp + 1, ac_max)
         if new_temp != current_ac_temp:
             desired_temp = new_temp
             ac_action = f"Increased set-point to {new_temp}°C"
         else:
-            log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", AC_TEMP_MAX)
-            ac_action = f"At max limit ({AC_TEMP_MAX}°C), no increase"
+            log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", ac_max)
+            ac_action = f"At max limit ({ac_max}°C), no increase"
             desired_temp = current_ac_temp
     else:
-        new_temp = max(current_ac_temp - 1, AC_TEMP_MIN)
+        new_temp = max(current_ac_temp - 1, ac_min)
         if new_temp != current_ac_temp:
             desired_temp = new_temp
             ac_action = f"Decreased set-point to {new_temp}°C"
         else:
-            log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", AC_TEMP_MIN)
-            ac_action = f"At min limit ({AC_TEMP_MIN}°C), no decrease"
+            log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", ac_min)
+            ac_action = f"At min limit ({ac_min}°C), no decrease"
             desired_temp = current_ac_temp
 
     desired_fan = None
     target_set_for_fan = desired_temp
-    if target_set_for_fan in FAN_SPEED_TABLE:
-        target_fan_int = FAN_SPEED_TABLE[target_set_for_fan]
+    if target_set_for_fan in fan_speed_table:
+        target_fan_int = fan_speed_table[target_set_for_fan]
         target_fan_str = INT_TO_FAN.get(target_fan_int)
         if target_fan_str is None:
             log.warning("Fan speed integer %d has no API mapping, skipping", target_fan_int)
@@ -627,22 +881,27 @@ def regulate(
         ac_state = pod.get("acState", {})
         measurement = pod.get("measurements", {})
 
-        room_temp = measurement.get("temperature")
+        sensibo_room_temp = measurement.get("temperature")
         ac_set_temp = ac_state.get("targetTemperature")
         ac_mode = ac_state.get("mode", "").lower()
         ac_on = ac_state.get("on", False)
         ac_fan = ac_state.get("fanLevel", "")
 
-        if room_temp is None:
+        if sensibo_room_temp is None:
             raise SensiboError("No temperature reading in measurements")
         if ac_set_temp is None:
             raise SensiboError("No targetTemperature in AC state")
+
+        # Apply calibration offset immediately after reading:
+        # adjusted_room_temp = sensibo_room_temp + ROOM_TEMP_OFFSET
+        offset = config_manager.get("ROOM_TEMP_OFFSET", ROOM_TEMP_OFFSET)
+        room_temp = round(float(sensibo_room_temp) + offset, 2)
 
         # All samples integrated in EMA filter, even during rate-limits or when AC is off
         avg_temp = update_ema_filter(room_temp, now_epoch)
 
         update_shared_state(
-            room_temp=room_temp,
+            room_temp=round(room_temp, 1),
             avg_temp=round(avg_temp, 2),
             ac_set_temp=ac_set_temp,
             ac_mode=ac_mode,
@@ -660,17 +919,21 @@ def regulate(
             delta = None
         else:
             # 3. Dual temperature regulation
-            delta = round(room_temp - TARGET_ROOM_TEMP, 2)
+            target_room_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
+            fast_threshold = config_manager.get("FAST_THRESHOLD", FAST_THRESHOLD)
+            slow_threshold = config_manager.get("SLOW_THRESHOLD", SLOW_THRESHOLD)
+
+            delta = round(room_temp - target_room_temp, 2)
             log.info(
                 "Room: %.1f°C  Avg: %.2f°C  Target: %.1f°C  AC set: %d°C  Delta: %+.2f°C",
-                room_temp, avg_temp, TARGET_ROOM_TEMP, ac_set_temp, delta,
+                room_temp, avg_temp, target_room_temp, ac_set_temp, delta,
             )
 
             # Determine fast regulator trigger
             fast_direction = 0
-            if delta < -FAST_THRESHOLD:
+            if delta < -fast_threshold:
                 fast_direction = 1
-            elif delta > FAST_THRESHOLD:
+            elif delta > fast_threshold:
                 fast_direction = -1
 
             if fast_direction != 0:
@@ -695,9 +958,9 @@ def regulate(
                 else:
                     # Fast is happy and not rate-limited -> evaluate slow regulator
                     slow_direction = 0
-                    if avg_temp < TARGET_ROOM_TEMP - SLOW_THRESHOLD:
+                    if avg_temp < target_room_temp - slow_threshold:
                         slow_direction = 1
-                    elif avg_temp > TARGET_ROOM_TEMP + SLOW_THRESHOLD:
+                    elif avg_temp > target_room_temp + slow_threshold:
                         slow_direction = -1
 
                     if slow_direction != 0:
@@ -742,9 +1005,11 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
     Fast regulator enforces CHECK_INTERVAL_MINUTES cooldown.
     Slow regulator enforces 2 * CHECK_INTERVAL_MINUTES cooldown.
     """
+    read_interval = config_manager.get("READ_INTERVAL_MINUTES", READ_INTERVAL_MINUTES)
+    check_interval = config_manager.get("CHECK_INTERVAL_MINUTES", CHECK_INTERVAL_MINUTES)
     log.info(
         "Regulation loop started. Read every %d min, Fast min %d min, Slow min %d min.",
-        READ_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES, 2 * CHECK_INTERVAL_MINUTES,
+        read_interval, check_interval, 2 * check_interval,
     )
     now_startup = time.time()
     last_fast_change_time: float = now_startup   # active from startup to block changes for first CHECK_INTERVAL_MINUTES
@@ -752,14 +1017,16 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
 
     while True:
         now_epoch = time.time()
+        check_interval = config_manager.get("CHECK_INTERVAL_MINUTES", CHECK_INTERVAL_MINUTES)
+        read_interval = config_manager.get("READ_INTERVAL_MINUTES", READ_INTERVAL_MINUTES)
         fast_elapsed = (now_epoch - last_fast_change_time) / 60.0
         slow_elapsed = (now_epoch - last_slow_change_time) / 60.0
 
-        fast_rate_limited = fast_elapsed < CHECK_INTERVAL_MINUTES
-        slow_rate_limited = slow_elapsed < (2 * CHECK_INTERVAL_MINUTES)
+        fast_rate_limited = fast_elapsed < check_interval
+        slow_rate_limited = slow_elapsed < (2 * check_interval)
 
-        fast_status = "allowed" if not fast_rate_limited else f"locked {CHECK_INTERVAL_MINUTES - fast_elapsed:.0f}m"
-        slow_status = "allowed" if not slow_rate_limited else f"locked {2 * CHECK_INTERVAL_MINUTES - slow_elapsed:.0f}m"
+        fast_status = "allowed" if not fast_rate_limited else f"locked {check_interval - fast_elapsed:.0f}m"
+        slow_status = "allowed" if not slow_rate_limited else f"locked {2 * check_interval - slow_elapsed:.0f}m"
 
         log.info(
             "--- Regulation cycle start [Fast: %s, Slow: %s] ---",
@@ -789,8 +1056,8 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
                 last_fast_change_time = now_done
                 # Fast regulator does not reset slow regulator rate limit
 
-        log.info("--- Next read in %d min ---", READ_INTERVAL_MINUTES)
-        time.sleep(READ_INTERVAL_MINUTES * 60)
+        log.info("--- Next read in %d min ---", read_interval)
+        time.sleep(read_interval * 60)
 
 
 
@@ -798,7 +1065,7 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
 # Flask web dashboard
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = SESSION_SECRET_KEY
+app.secret_key = config_manager.get("SESSION_SECRET_KEY", SESSION_SECRET_KEY)
 
 def login_required(f):
     @wraps(f)
@@ -848,6 +1115,21 @@ _BASE_STYLE = """
     background: #2563eb; color: #fff; font-size: 0.85rem; border: none; cursor: pointer;
   }
   .btn:hover { background: #1d4ed8; }
+  .target-control {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem;
+  }
+  .target-btn-group {
+    display: inline-flex; flex-direction: column; gap: 2px;
+  }
+  .target-btn {
+    background: #fff; border: 1px solid #cbd5e1; border-radius: 4px;
+    width: 22px; height: 16px; display: inline-flex; align-items: center;
+    justify-content: center; cursor: pointer; font-size: 0.75rem; line-height: 1;
+    color: #1e3a5f; padding: 0; transition: background .15s, border-color .15s;
+    user-select: none;
+  }
+  .target-btn:hover:not(:disabled) { background: #e2e8f0; border-color: #94a3b8; }
+  .target-btn:disabled { opacity: 0.35; cursor: not-allowed; }
   .login-wrap {
     display: flex; align-items: center; justify-content: center; min-height: 100vh;
   }
@@ -963,7 +1245,13 @@ _DASHBOARD_TEMPLATE = """
       </div>
       <div class="stat">
         <div class="label">Target Temp</div>
-        <div class="value">{{ target }}</div>
+        <div class="target-control">
+          <div class="value" id="target_temp">{{ '%.1f'|format(target) }}</div>
+          <div class="target-btn-group">
+            <button type="button" class="target-btn" id="targetUpBtn" title="Increase target temperature by 0.1 °C"{% if target >= cfg.AC_TEMP_MAX %} disabled{% endif %}>↑</button>
+            <button type="button" class="target-btn" id="targetDownBtn" title="Decrease target temperature by 0.1 °C"{% if target <= cfg.AC_TEMP_MIN %} disabled{% endif %}>↓</button>
+          </div>
+        </div>
         <div class="unit">°C</div>
       </div>
       <div class="stat">
@@ -1063,10 +1351,11 @@ _DASHBOARD_TEMPLATE = """
 
   <!-- Config summary -->
   <div class="card">
-    <h2>Configuration (read-only)</h2>
+    <h2>Configuration <span style="font-size:0.75rem;font-weight:400;color:#888">(sensibo_temp_reg_setting.json)</span></h2>
     <table class="config-table">
       <tbody>
-        <tr><td>TARGET_ROOM_TEMP</td><td>{{ target }} °C</td></tr>
+        <tr><td>TARGET_ROOM_TEMP</td><td id="cfg_target">{{ '%.1f'|format(target) }} °C</td></tr>
+        <tr><td>ROOM_TEMP_OFFSET</td><td>{{ cfg.ROOM_TEMP_OFFSET }} °C (sensor calibration offset)</td></tr>
         <tr><td>FAST_THRESHOLD</td><td>{{ cfg.FAST_THRESHOLD }} °C (± threshold for fast regulator)</td></tr>
         <tr><td>SLOW_THRESHOLD</td><td>{{ cfg.SLOW_THRESHOLD }} °C (± threshold for slow regulator)</td></tr>
         <tr><td>SLOW_TAU</td><td>{{ cfg.SLOW_TAU }} min (EMA filter time constant)</td></tr>
@@ -1470,6 +1759,78 @@ _DASHBOARD_TEMPLATE = """
   window._loadChart = loadChart;
 })();
 
+// ── Target Temperature Controller ───────────────────────────────────────────
+(function () {
+  let currentTarget = {{ target }};
+  window._currentTarget = currentTarget;
+  const minTemp = {{ cfg.AC_TEMP_MIN }};
+  const maxTemp = {{ cfg.AC_TEMP_MAX }};
+  const fastThresh = {{ cfg.FAST_THRESHOLD }};
+
+  function updateButtonStates(val) {
+    const upBtn = document.getElementById('targetUpBtn');
+    const downBtn = document.getElementById('targetDownBtn');
+    if (upBtn) upBtn.disabled = val >= maxTemp;
+    if (downBtn) downBtn.disabled = val <= minTemp;
+  }
+
+  function updateDeltaDisplay(targetVal) {
+    const deltaEl = document.getElementById('delta');
+    const roomEl = document.getElementById('room_temp');
+    if (!deltaEl || !roomEl) return;
+    const rt = parseFloat(roomEl.textContent);
+    if (!isNaN(rt)) {
+      const delta = (rt - targetVal).toFixed(1);
+      deltaEl.textContent = (delta >= 0 ? '+' : '') + delta;
+      deltaEl.className = 'value ' + (Math.abs(delta) < fastThresh ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
+    }
+  }
+
+  function adjustTarget(delta) {
+    const nextTarget = Math.round((currentTarget + delta) * 10) / 10;
+    if (nextTarget < minTemp || nextTarget > maxTemp) return;
+
+    const upBtn = document.getElementById('targetUpBtn');
+    const downBtn = document.getElementById('targetDownBtn');
+    if (upBtn) upBtn.disabled = true;
+    if (downBtn) downBtn.disabled = true;
+
+    fetch('/api/target_temp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delta: delta })
+    })
+    .then(r => {
+      if (!r.ok) {
+        return r.json().then(d => { throw new Error(d.error || 'Update failed'); });
+      }
+      return r.json();
+    })
+    .then(data => {
+      currentTarget = data.target_room_temp;
+      window._currentTarget = currentTarget;
+      const targetEl = document.getElementById('target_temp');
+      if (targetEl) targetEl.textContent = Number(currentTarget).toFixed(1);
+      const cfgTargetEl = document.getElementById('cfg_target');
+      if (cfgTargetEl) cfgTargetEl.textContent = Number(currentTarget).toFixed(1) + ' °C';
+      updateButtonStates(currentTarget);
+      updateDeltaDisplay(currentTarget);
+      if (window._loadChart) window._loadChart();
+    })
+    .catch(err => {
+      alert('Could not update target temperature: ' + err.message);
+      updateButtonStates(currentTarget);
+    });
+  }
+
+  const upBtn = document.getElementById('targetUpBtn');
+  const downBtn = document.getElementById('targetDownBtn');
+  if (upBtn) upBtn.addEventListener('click', () => adjustTarget(0.1));
+  if (downBtn) downBtn.addEventListener('click', () => adjustTarget(-0.1));
+
+  updateButtonStates(currentTarget);
+})();
+
 // ── Events table rebuilder ────────────────────────────────────────────────────
 function rebuildEventsTable(rows) {
   const wrap = document.getElementById('events-wrap');
@@ -1508,8 +1869,19 @@ setInterval(() => {
       set('ac_fan',      d.ac_fan      ?? '—');
       set('ac_mode',     d.ac_mode     ?? '—');
       set('last_checked',d.last_checked ?? '—');
+      if (d.target_room_temp !== undefined) {
+        window._currentTarget = d.target_room_temp;
+        set('target_temp', Number(d.target_room_temp).toFixed(1));
+        const upBtn = document.getElementById('targetUpBtn');
+        const downBtn = document.getElementById('targetDownBtn');
+        if (upBtn) upBtn.disabled = d.target_room_temp >= {{ cfg.AC_TEMP_MAX }};
+        if (downBtn) downBtn.disabled = d.target_room_temp <= {{ cfg.AC_TEMP_MIN }};
+        const cfgTargetEl = document.getElementById('cfg_target');
+        if (cfgTargetEl) cfgTargetEl.textContent = Number(d.target_room_temp).toFixed(1) + ' °C';
+      }
       if (d.room_temp) {
-        const delta = (parseFloat(d.room_temp) - {{ target }}).toFixed(1);
+        const curTarget = window._currentTarget !== undefined ? window._currentTarget : {{ target }};
+        const delta = (parseFloat(d.room_temp) - curTarget).toFixed(1);
         const el = document.getElementById('delta');
         if (el) {
           el.textContent = (delta >= 0 ? '+' : '') + delta;
@@ -1580,8 +1952,10 @@ _LOG_TEMPLATE = """
 def login_page():
     error = None
     if request.method == "POST":
-        if (request.form.get("username") == WEB_USERNAME and
-                request.form.get("password") == WEB_PASSWORD):
+        web_user = config_manager.get("WEB_USERNAME", WEB_USERNAME)
+        web_pass = config_manager.get("WEB_PASSWORD", WEB_PASSWORD)
+        if (request.form.get("username") == web_user and
+                request.form.get("password") == web_pass):
             session["logged_in"] = True
             return redirect(request.args.get("next") or url_for("dashboard"))
         error = "Invalid username or password."
@@ -1598,30 +1972,24 @@ def dashboard():
     s = get_shared_state()
     rows = read_event_rows(max_rows=20)   # only rows where something changed
 
+    target_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
+    fast_thresh = config_manager.get("FAST_THRESHOLD", FAST_THRESHOLD)
+
     delta_class = "delta-ok"
     if s.get("room_temp") and s["room_temp"] != "N/A":
-        delta = float(s["room_temp"]) - TARGET_ROOM_TEMP
-        if delta < -FAST_THRESHOLD:
+        delta = float(s["room_temp"]) - target_temp
+        if delta < -fast_thresh:
             delta_class = "delta-cold"
-        elif delta > FAST_THRESHOLD:
+        elif delta > fast_thresh:
             delta_class = "delta-warm"
 
     return render_template_string(
         _DASHBOARD_TEMPLATE,
         s=s,
         rows=rows,
-        target=TARGET_ROOM_TEMP,
+        target=target_temp,
         delta_class=delta_class,
-        cfg={
-            "FAST_THRESHOLD": FAST_THRESHOLD,
-            "SLOW_THRESHOLD": SLOW_THRESHOLD,
-            "SLOW_TAU": SLOW_TAU,
-            "AC_TEMP_MIN": AC_TEMP_MIN,
-            "AC_TEMP_MAX": AC_TEMP_MAX,
-            "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
-            "CHECK_INTERVAL_MINUTES": CHECK_INTERVAL_MINUTES,
-            "FAN_SPEED_TABLE": FAN_SPEED_TABLE,
-        },
+        cfg=config_manager.get_all(),
     )
 
 
@@ -1629,7 +1997,107 @@ def dashboard():
 @login_required
 def api_status():
     s = get_shared_state()
+    s["target_room_temp"] = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
     return jsonify(s)
+
+
+@app.route("/api/target_temp", methods=["POST"])
+@login_required
+def api_target_temp():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    min_temp = config_manager.get("AC_TEMP_MIN", AC_TEMP_MIN)
+    max_temp = config_manager.get("AC_TEMP_MAX", AC_TEMP_MAX)
+
+    if "delta" in payload:
+        try:
+            delta = float(payload["delta"])
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid delta value"}), 400
+        try:
+            new_target = config_manager.adjust_target_temp(delta)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            log.error("Failed to persist target temperature update: %s", exc)
+            return jsonify({"error": f"Failed to persist configuration: {exc}"}), 500
+    elif "target_room_temp" in payload or "target_temp" in payload:
+        raw_val = payload.get("target_room_temp", payload.get("target_temp"))
+        try:
+            target_val = round(float(raw_val), 1)
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid target temperature value"}), 400
+        if target_val < min_temp or target_val > max_temp:
+            return jsonify({
+                "error": f"Target temperature {target_val:.1f}°C is outside limits ({min_temp}°C - {max_temp}°C)"
+            }), 400
+        try:
+            config_manager.update_config({"TARGET_ROOM_TEMP": target_val})
+            new_target = target_val
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            log.error("Failed to persist target temperature update: %s", exc)
+            return jsonify({"error": f"Failed to persist configuration: {exc}"}), 500
+    elif payload.get("action") == "increase":
+        try:
+            new_target = config_manager.adjust_target_temp(0.1)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            log.error("Failed to persist target temperature update: %s", exc)
+            return jsonify({"error": f"Failed to persist configuration: {exc}"}), 500
+    elif payload.get("action") == "decrease":
+        try:
+            new_target = config_manager.adjust_target_temp(-0.1)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            log.error("Failed to persist target temperature update: %s", exc)
+            return jsonify({"error": f"Failed to persist configuration: {exc}"}), 500
+    else:
+        return jsonify({"error": "Missing delta, target_room_temp, or action"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "target_room_temp": new_target,
+        "min": min_temp,
+        "max": max_temp,
+    })
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+@login_required
+def api_config():
+    if request.method == "GET":
+        cfg = config_manager.get_all()
+        # Credentials are kept confidential
+        safe_cfg = {
+            k: v for k, v in cfg.items()
+            if k not in ("SENSIBO_API_KEY", "WEB_PASSWORD", "SESSION_SECRET_KEY")
+        }
+        return jsonify(safe_cfg)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    allowed_runtime_fields = {"TARGET_ROOM_TEMP", "ROOM_TEMP_OFFSET"}
+    updates = {k: v for k, v in payload.items() if k in allowed_runtime_fields}
+    if not updates:
+        return jsonify({"error": "No valid runtime configuration fields provided for update"}), 400
+
+    try:
+        updated = config_manager.update_config(updates)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        log.error("Failed to persist configuration update: %s", exc)
+        return jsonify({"error": f"Failed to persist configuration: {exc}"}), 500
+
+    return jsonify({"status": "ok", "updated": updates})
 
 
 @app.route("/api/chart")
@@ -1677,36 +2145,47 @@ def log_view():
 # ---------------------------------------------------------------------------
 
 def main():
-    global SENSIBO_DEVICE_ID
-
-    if SENSIBO_API_KEY == "YOUR_API_KEY_HERE":
-        print("ERROR: Please set SENSIBO_API_KEY in the config section at the top of this file.")
-        sys.exit(1)
-
-    client = SensiboClient(SENSIBO_API_KEY)
-
-    # Device picker
-    device_id = SENSIBO_DEVICE_ID.strip()
-    if not device_id:
-        try:
-            device_id = client.pick_device_interactive()
-        except SensiboError as exc:
-            print(f"ERROR: {exc}")
+    try:
+        api_key = config_manager.get("SENSIBO_API_KEY", SENSIBO_API_KEY).strip()
+        if api_key == "YOUR_API_KEY_HERE" or not api_key:
+            print("ERROR: Please set SENSIBO_API_KEY in sensibo_temp_reg_setting.json or in the config defaults.")
             sys.exit(1)
 
-    # Start regulation loop in a daemon thread
-    reg_thread = threading.Thread(
-        target=regulation_loop,
-        args=(client, device_id),
-        daemon=True,
-        name="regulation-loop",
-    )
-    reg_thread.start()
+        client = SensiboClient(api_key)
 
-    # Start Flask (blocking, main thread)
-    log.info("Web dashboard: http://localhost:%d", WEB_PORT)
-    log.info("Login with username '%s'", WEB_USERNAME)
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
+        # Device picker
+        device_id = config_manager.get("SENSIBO_DEVICE_ID", SENSIBO_DEVICE_ID).strip()
+        if not device_id:
+            try:
+                device_id = client.pick_device_interactive()
+                config_manager.update_config({"SENSIBO_DEVICE_ID": device_id})
+                print(f"Device ID '{device_id}' saved to {CONFIG_FILENAME}\n")
+            except SensiboError as exc:
+                print(f"ERROR: {exc}")
+                sys.exit(1)
+
+        # Start regulation loop in a daemon thread
+        reg_thread = threading.Thread(
+            target=regulation_loop,
+            args=(client, device_id),
+            daemon=True,
+            name="regulation-loop",
+        )
+        reg_thread.start()
+
+        # Start Flask (blocking, main thread)
+        web_host = config_manager.get("WEB_HOST", WEB_HOST)
+        web_port = int(config_manager.get("WEB_PORT", WEB_PORT))
+        web_user = config_manager.get("WEB_USERNAME", WEB_USERNAME)
+
+        log.info("Web dashboard: http://localhost:%d", web_port)
+        log.info("Login with username '%s'", web_user)
+        app.run(host=web_host, port=web_port, debug=False, use_reloader=False)
+
+    except ConfigurationError as exc:
+        log.critical("Configuration error: %s", exc)
+        print(f"\nFATAL CONFIGURATION ERROR: {exc}\n", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
