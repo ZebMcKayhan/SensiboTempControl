@@ -40,8 +40,8 @@ SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) 
 SLOW_TAU       = 120            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
-AC_TEMP_MIN = 20                # °C — never set AC below this
-AC_TEMP_MAX = 27                # °C — never set AC above this
+AC_TEMP_MIN = 20                # 8-30 °C — never set AC below this
+AC_TEMP_MAX = 27                # 8-30 °C — never set AC above this
 
 # ── Fan-speed table  (AC set-point [°C] → fan speed integer 1–6) ─────────────
 # Only temperatures listed here will trigger a fan-speed change.
