@@ -40,8 +40,10 @@ SLOW_THRESHOLD = 0.2            # °C deviation of EMA average from target (±) 
 SLOW_TAU       = 120            # minutes — EMA filter time constant
 
 # ── AC set-point limits ───────────────────────────────────────────────────────
-AC_TEMP_MIN = 20                # 8-30 °C — never set AC below this
-AC_TEMP_MAX = 27                # 8-30 °C — never set AC above this
+AC_TEMP_MIN     = 8             # 8-30 °C — absolute hardware minimum set-point
+AC_TEMP_MAX     = 30            # 8-30 °C — absolute hardware maximum set-point
+AC_TEMP_MIN_REL = -2            # relative offset from floor(target_room_temp)
+AC_TEMP_MAX_REL = 5             # relative offset from floor(target_room_temp)
 
 # ── Fan-speed table  (AC set-point [°C] → fan speed integer 1–6) ─────────────
 # Only temperatures listed here will trigger a fan-speed change.
@@ -122,6 +124,8 @@ DEFAULT_CONFIG = {
     "SLOW_TAU": SLOW_TAU,
     "AC_TEMP_MIN": AC_TEMP_MIN,
     "AC_TEMP_MAX": AC_TEMP_MAX,
+    "AC_TEMP_MIN_REL": AC_TEMP_MIN_REL,
+    "AC_TEMP_MAX_REL": AC_TEMP_MAX_REL,
     "FAN_SPEED_TABLE": FAN_SPEED_TABLE,
     "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
     "CHECK_INTERVAL_MINUTES": CHECK_INTERVAL_MINUTES,
@@ -202,6 +206,10 @@ class ConfigManager:
             cfg["AC_TEMP_MIN"] = int(cfg["AC_TEMP_MIN"])
         if "AC_TEMP_MAX" in cfg:
             cfg["AC_TEMP_MAX"] = int(cfg["AC_TEMP_MAX"])
+        if "AC_TEMP_MIN_REL" in cfg:
+            cfg["AC_TEMP_MIN_REL"] = int(cfg["AC_TEMP_MIN_REL"])
+        if "AC_TEMP_MAX_REL" in cfg:
+            cfg["AC_TEMP_MAX_REL"] = int(cfg["AC_TEMP_MAX_REL"])
         if "READ_INTERVAL_MINUTES" in cfg:
             cfg["READ_INTERVAL_MINUTES"] = int(cfg["READ_INTERVAL_MINUTES"])
         if "CHECK_INTERVAL_MINUTES" in cfg:
@@ -218,6 +226,13 @@ class ConfigManager:
             raise ValueError("AC_TEMP_MIN and AC_TEMP_MAX must be numeric.")
         if ac_min >= ac_max:
             raise ValueError(f"AC_TEMP_MIN ({ac_min}) must be less than AC_TEMP_MAX ({ac_max}).")
+
+        rel_min = cfg.get("AC_TEMP_MIN_REL")
+        rel_max = cfg.get("AC_TEMP_MAX_REL")
+        if not isinstance(rel_min, (int, float)) or not isinstance(rel_max, (int, float)):
+            raise ValueError("AC_TEMP_MIN_REL and AC_TEMP_MAX_REL must be numeric.")
+        if rel_min >= rel_max:
+            raise ValueError(f"AC_TEMP_MIN_REL ({rel_min}) must be less than AC_TEMP_MAX_REL ({rel_max}).")
 
         target = cfg.get("TARGET_ROOM_TEMP")
         if not isinstance(target, (int, float)):
@@ -323,10 +338,10 @@ class ConfigManager:
     def adjust_target_temp(self, delta: float) -> float:
         """Adjust TARGET_ROOM_TEMP by delta (e.g. +0.1 or -0.1) atomically."""
         with self._lock:
-            cur_target = self._config.get("TARGET_ROOM_TEMP", 22.8)
+            cur_target = self._config.get("TARGET_ROOM_TEMP", 22.4)
             new_target = round(cur_target + delta, 1)
-            min_temp = self._config.get("AC_TEMP_MIN", 20)
-            max_temp = self._config.get("AC_TEMP_MAX", 27)
+            min_temp = self._config.get("AC_TEMP_MIN", 8)
+            max_temp = self._config.get("AC_TEMP_MAX", 30)
             if new_target < min_temp or new_target > max_temp:
                 raise ValueError(
                     f"Target temperature {new_target:.1f}°C is outside limits ({min_temp}°C - {max_temp}°C)"
@@ -406,7 +421,7 @@ def update_ema_filter(room_temp: float, now_epoch: float) -> float:
 # Log file helpers
 # ---------------------------------------------------------------------------
 _log_lock = threading.Lock()
-LOG_FIELDS = ["timestamp", "room_temp", "ac_set_temp", "delta", "ac_action", "fan_action", "changed"]
+LOG_FIELDS = ["timestamp", "target_room_temp", "room_temp", "average_temp", "ac_set_temp", "ac_action", "fan_action", "changed"]
 
 def _log_file_path() -> str:
     log_file = config_manager.get("LOG_FILE", "/var/log/sensibo/sensibo_reg.log")
@@ -551,7 +566,21 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
             ac = float(r["ac_set_temp"])
         except (ValueError, KeyError):
             continue
-        raw_points.append({"ts": ts, "room_temp": rt, "ac_set_temp": ac})
+        try:
+            tgt = float(r["target_room_temp"])
+        except (ValueError, KeyError):
+            tgt = target_temp
+        try:
+            avg = float(r["average_temp"])
+        except (ValueError, KeyError):
+            avg = None
+        raw_points.append({
+            "ts": ts,
+            "room_temp": rt,
+            "ac_set_temp": ac,
+            "target_room_temp": tgt,
+            "average_temp": avg,
+        })
 
     # Deduplicate by timestamp (last logged entry wins) and sort chronologically
     deduped = {}
@@ -578,18 +607,25 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
             g_list = list(group)
             avg_rt = round(sum(p["room_temp"] for p in g_list) / len(g_list), 1)
             last_ac = g_list[-1]["ac_set_temp"]
+            last_tgt = g_list[-1]["target_room_temp"]
+            valid_avgs = [p["average_temp"] for p in g_list if p["average_temp"] is not None]
+            avg_avg = round(sum(valid_avgs) / len(valid_avgs), 2) if valid_avgs else None
             b_ts = start_dt + timedelta(seconds=(b_idx + 0.5) * bucket_seconds)
             points.append({
                 "timestamp": b_ts.strftime("%Y-%m-%dT%H:%M:%S"),
                 "room_temp": avg_rt,
+                "average_temp": avg_avg,
                 "ac_set_temp": last_ac,
+                "target_room_temp": last_tgt,
             })
     else:
         points = [
             {
                 "timestamp": p["ts"].strftime("%Y-%m-%dT%H:%M:%S"),
                 "room_temp": p["room_temp"],
+                "average_temp": p["average_temp"],
                 "ac_set_temp": p["ac_set_temp"],
+                "target_room_temp": p["target_room_temp"],
             }
             for p in sorted_points
         ]
@@ -765,35 +801,43 @@ def apply_ac_change(
     current_ac_temp: int,
     direction: int,
     current_fan: str,
+    target_room_temp: float,
 ) -> tuple[int, str, str, bool]:
     """
-    Applies an AC set-point adjustment (+1 or -1), enforces AC_TEMP_MIN/MAX limits,
+    Applies an AC set-point adjustment (+1 or -1), enforces dynamic AC_TEMP limits
+    derived from floor(target_room_temp) bounded by [AC_TEMP_MIN, AC_TEMP_MAX],
     looks up fan speed from FAN_SPEED_TABLE, and sends a single combined API call if needed.
 
     Returns:
         (new_ac_temp, ac_action, fan_action, changed)
     """
-    ac_min = config_manager.get("AC_TEMP_MIN", AC_TEMP_MIN)
-    ac_max = config_manager.get("AC_TEMP_MAX", AC_TEMP_MAX)
+    ac_abs_min = config_manager.get("AC_TEMP_MIN", AC_TEMP_MIN)
+    ac_abs_max = config_manager.get("AC_TEMP_MAX", AC_TEMP_MAX)
+    rel_min = config_manager.get("AC_TEMP_MIN_REL", AC_TEMP_MIN_REL)
+    rel_max = config_manager.get("AC_TEMP_MAX_REL", AC_TEMP_MAX_REL)
     fan_speed_table = config_manager.get("FAN_SPEED_TABLE", FAN_SPEED_TABLE)
 
+    base = math.floor(target_room_temp)
+    reg_min = max(ac_abs_min, base + rel_min)
+    reg_max = min(ac_abs_max, base + rel_max)
+
     if direction > 0:
-        new_temp = min(current_ac_temp + 1, ac_max)
+        new_temp = min(current_ac_temp + 1, reg_max)
         if new_temp != current_ac_temp:
             desired_temp = new_temp
             ac_action = f"Increased set-point to {new_temp}°C"
         else:
-            log.warning("Already at AC_TEMP_MAX (%d°C), cannot increase further", ac_max)
-            ac_action = f"At max limit ({ac_max}°C), no increase"
+            log.warning("Already at regulator max limit (%d°C), cannot increase further", reg_max)
+            ac_action = f"At max limit ({reg_max}°C), no increase"
             desired_temp = current_ac_temp
     else:
-        new_temp = max(current_ac_temp - 1, ac_min)
+        new_temp = max(current_ac_temp - 1, reg_min)
         if new_temp != current_ac_temp:
             desired_temp = new_temp
             ac_action = f"Decreased set-point to {new_temp}°C"
         else:
-            log.warning("Already at AC_TEMP_MIN (%d°C), cannot decrease further", ac_min)
-            ac_action = f"At min limit ({ac_min}°C), no decrease"
+            log.warning("Already at regulator min limit (%d°C), cannot decrease further", reg_min)
+            ac_action = f"At min limit ({reg_min}°C), no decrease"
             desired_temp = current_ac_temp
 
     desired_fan = None
@@ -864,6 +908,7 @@ def regulate(
     Returns:
         (changed, regulator_source) where regulator_source is 'fast', 'slow', or None.
     """
+    target_room_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     now_epoch = time.time()
     ac_action = "Error"
@@ -871,7 +916,6 @@ def regulate(
     room_temp = None
     avg_temp = None
     ac_set_temp = None
-    delta = None
     changed = False
     regulator_source: str | None = None
 
@@ -916,10 +960,8 @@ def regulate(
             log.info("Skipped — AC is %s (not in heat mode)", reason)
             ac_action = f"Skipped ({reason})"
             fan_action = "Skipped"
-            delta = None
         else:
             # 3. Dual temperature regulation
-            target_room_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
             fast_threshold = config_manager.get("FAST_THRESHOLD", FAST_THRESHOLD)
             slow_threshold = config_manager.get("SLOW_THRESHOLD", SLOW_THRESHOLD)
 
@@ -947,7 +989,7 @@ def regulate(
                 else:
                     regulator_source = "fast"
                     ac_set_temp, ac_action, fan_action, changed = apply_ac_change(
-                        client, device_id, ac_state, ac_set_temp, fast_direction, ac_fan
+                        client, device_id, ac_state, ac_set_temp, fast_direction, ac_fan, target_room_temp
                     )
             else:
                 # Fast regulator is happy with no change
@@ -974,7 +1016,7 @@ def regulate(
                         else:
                             regulator_source = "slow"
                             ac_set_temp, ac_action, fan_action, changed = apply_ac_change(
-                                client, device_id, ac_state, ac_set_temp, slow_direction, ac_fan
+                                client, device_id, ac_state, ac_set_temp, slow_direction, ac_fan, target_room_temp
                             )
                     else:
                         ac_action = "No change"
@@ -982,15 +1024,15 @@ def regulate(
 
     except SensiboError as exc:
         log.error("Regulation cycle failed: %s", exc)
-        ac_action = f"API Error: {exc}"
-        fan_action = "N/A"
+        return False, None
 
-    # 4. Append log row (every cycle so log is complete)
+    # 4. Append log row (only on successful cycle)
     append_log_row({
         "timestamp": now,
+        "target_room_temp": f"{target_room_temp:.1f}",
         "room_temp": f"{room_temp:.1f}" if room_temp is not None else "N/A",
+        "average_temp": f"{avg_temp:.2f}" if avg_temp is not None else "N/A",
         "ac_set_temp": ac_set_temp if ac_set_temp is not None else "N/A",
-        "delta": f"{delta:+.2f}" if delta is not None else "N/A",
         "ac_action": ac_action,
         "fan_action": fan_action,
         "changed": "yes" if changed else "no",
@@ -1003,30 +1045,32 @@ def regulation_loop(client: SensiboClient, device_id: str) -> None:
     """
     Background thread: poll sensor every READ_INTERVAL_MINUTES.
     Fast regulator enforces CHECK_INTERVAL_MINUTES cooldown.
-    Slow regulator enforces 2 * CHECK_INTERVAL_MINUTES cooldown.
+    Slow regulator enforces SLOW_TAU cooldown.
     """
     read_interval = config_manager.get("READ_INTERVAL_MINUTES", READ_INTERVAL_MINUTES)
     check_interval = config_manager.get("CHECK_INTERVAL_MINUTES", CHECK_INTERVAL_MINUTES)
+    slow_tau = config_manager.get("SLOW_TAU", SLOW_TAU)
     log.info(
         "Regulation loop started. Read every %d min, Fast min %d min, Slow min %d min.",
-        read_interval, check_interval, 2 * check_interval,
+        read_interval, check_interval, slow_tau,
     )
     now_startup = time.time()
     last_fast_change_time: float = now_startup   # active from startup to block changes for first CHECK_INTERVAL_MINUTES
-    last_slow_change_time: float = now_startup   # active from startup to block changes for first 2 * CHECK_INTERVAL_MINUTES
+    last_slow_change_time: float = now_startup   # active from startup to block changes for first SLOW_TAU minutes
 
     while True:
         now_epoch = time.time()
         check_interval = config_manager.get("CHECK_INTERVAL_MINUTES", CHECK_INTERVAL_MINUTES)
         read_interval = config_manager.get("READ_INTERVAL_MINUTES", READ_INTERVAL_MINUTES)
+        slow_tau = config_manager.get("SLOW_TAU", SLOW_TAU)
         fast_elapsed = (now_epoch - last_fast_change_time) / 60.0
         slow_elapsed = (now_epoch - last_slow_change_time) / 60.0
 
         fast_rate_limited = fast_elapsed < check_interval
-        slow_rate_limited = slow_elapsed < (2 * check_interval)
+        slow_rate_limited = slow_elapsed < slow_tau
 
         fast_status = "allowed" if not fast_rate_limited else f"locked {check_interval - fast_elapsed:.0f}m"
-        slow_status = "allowed" if not slow_rate_limited else f"locked {2 * check_interval - slow_elapsed:.0f}m"
+        slow_status = "allowed" if not slow_rate_limited else f"locked {slow_tau - slow_elapsed:.0f}m"
 
         log.info(
             "--- Regulation cycle start [Fast: %s, Slow: %s] ---",
@@ -1116,20 +1160,21 @@ _BASE_STYLE = """
   }
   .btn:hover { background: #1d4ed8; }
   .target-control {
-    display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem;
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.45rem;
   }
   .target-btn-group {
-    display: inline-flex; flex-direction: column; gap: 2px;
+    display: inline-flex; flex-direction: column; gap: 3px;
   }
   .target-btn {
-    background: #fff; border: 1px solid #cbd5e1; border-radius: 4px;
-    width: 22px; height: 16px; display: inline-flex; align-items: center;
-    justify-content: center; cursor: pointer; font-size: 0.75rem; line-height: 1;
-    color: #1e3a5f; padding: 0; transition: background .15s, border-color .15s;
+    background: #2563eb; border: 1px solid #1d4ed8; border-radius: 4px;
+    width: 26px; height: 20px; display: inline-flex; align-items: center;
+    justify-content: center; cursor: pointer; font-size: 0.85rem; line-height: 1;
+    color: #fff; padding: 0; transition: background .15s, border-color .15s;
     user-select: none;
   }
-  .target-btn:hover:not(:disabled) { background: #e2e8f0; border-color: #94a3b8; }
+  .target-btn:hover:not(:disabled) { background: #1d4ed8; border-color: #1e40af; }
   .target-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .stat-primary .value { font-size: 2.6rem; line-height: 1.1; }
   .login-wrap {
     display: flex; align-items: center; justify-content: center; min-height: 100vh;
   }
@@ -1233,17 +1278,7 @@ _DASHBOARD_TEMPLATE = """
   <div class="card" id="status-card">
     <h2>Current Status</h2>
     <div class="status-grid">
-      <div class="stat">
-        <div class="label">Room Temp</div>
-        <div class="value" id="room_temp">{{ s.room_temp if s.room_temp else '—' }}</div>
-        <div class="unit">°C</div>
-      </div>
-      <div class="stat">
-        <div class="label">Average Temp</div>
-        <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
-        <div class="unit">°C</div>
-      </div>
-      <div class="stat">
+      <div class="stat stat-primary">
         <div class="label">Target Temp</div>
         <div class="target-control">
           <div class="value" id="target_temp">{{ '%.1f'|format(target) }}</div>
@@ -1252,6 +1287,16 @@ _DASHBOARD_TEMPLATE = """
             <button type="button" class="target-btn" id="targetDownBtn" title="Decrease target temperature by 0.1 °C"{% if target <= cfg.AC_TEMP_MIN %} disabled{% endif %}>↓</button>
           </div>
         </div>
+        <div class="unit">°C</div>
+      </div>
+      <div class="stat">
+        <div class="label">Room Temp</div>
+        <div class="value" id="room_temp">{{ s.room_temp if s.room_temp else '—' }}</div>
+        <div class="unit">°C</div>
+      </div>
+      <div class="stat">
+        <div class="label">Average Temp</div>
+        <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
         <div class="unit">°C</div>
       </div>
       <div class="stat">
@@ -1266,15 +1311,6 @@ _DASHBOARD_TEMPLATE = """
       <div class="stat">
         <div class="label">Mode</div>
         <div class="value" id="ac_mode" style="font-size:1.2rem">{{ s.ac_mode if s.ac_mode else '—' }}</div>
-      </div>
-      <div class="stat">
-        <div class="label">Delta</div>
-        <div class="value {{ delta_class }}" id="delta">
-          {% if s.room_temp and s.room_temp != 'N/A' %}
-            {{ '%+.1f'|format(s.room_temp - target) }}
-          {% else %}—{% endif %}
-        </div>
-        <div class="unit">°C</div>
       </div>
     </div>
     <p style="font-size:0.75rem;color:#888;margin-top:0.75rem">
@@ -1310,6 +1346,10 @@ _DASHBOARD_TEMPLATE = """
         <span>Room Temp</span>
       </div>
       <div class="legend-item">
+        <div class="legend-dashed" style="border-color:#38bdf8"></div>
+        <span>Avg Temp</span>
+      </div>
+      <div class="legend-item">
         <div class="legend-swatch" style="background:#f59e0b"></div>
         <span>AC Set-Point</span>
       </div>
@@ -1327,16 +1367,17 @@ _DASHBOARD_TEMPLATE = """
     {% if rows %}
     <table>
       <thead><tr>
-        <th>Timestamp</th><th>Room °C</th><th>AC Set °C</th>
-        <th>Delta</th><th>AC Action</th><th>Fan Action</th>
+        <th>Timestamp</th><th>Target °C</th><th>Room °C</th><th>Avg °C</th><th>AC Set °C</th>
+        <th>AC Action</th><th>Fan Action</th>
       </tr></thead>
       <tbody>
       {% for r in rows %}
       <tr>
         <td>{{ r.timestamp }}</td>
+        <td>{{ r.target_room_temp }}</td>
         <td>{{ r.room_temp }}</td>
+        <td>{{ r.average_temp }}</td>
         <td>{{ r.ac_set_temp }}</td>
-        <td>{{ r.delta }}</td>
         <td>{{ r.ac_action }}</td>
         <td>{{ r.fan_action }}</td>
       </tr>
@@ -1359,8 +1400,10 @@ _DASHBOARD_TEMPLATE = """
         <tr><td>FAST_THRESHOLD</td><td>{{ cfg.FAST_THRESHOLD }} °C (± threshold for fast regulator)</td></tr>
         <tr><td>SLOW_THRESHOLD</td><td>{{ cfg.SLOW_THRESHOLD }} °C (± threshold for slow regulator)</td></tr>
         <tr><td>SLOW_TAU</td><td>{{ cfg.SLOW_TAU }} min (EMA filter time constant)</td></tr>
-        <tr><td>AC_TEMP_MIN</td><td>{{ cfg.AC_TEMP_MIN }} °C</td></tr>
-        <tr><td>AC_TEMP_MAX</td><td>{{ cfg.AC_TEMP_MAX }} °C</td></tr>
+        <tr><td>AC_TEMP_MIN</td><td>{{ cfg.AC_TEMP_MIN }} °C (hardware limit)</td></tr>
+        <tr><td>AC_TEMP_MAX</td><td>{{ cfg.AC_TEMP_MAX }} °C (hardware limit)</td></tr>
+        <tr><td>AC_TEMP_MIN_REL</td><td>{{ cfg.AC_TEMP_MIN_REL }} °C (relative to floor(target))</td></tr>
+        <tr><td>AC_TEMP_MAX_REL</td><td>{{ cfg.AC_TEMP_MAX_REL }} °C (relative to floor(target))</td></tr>
         <tr><td>READ_INTERVAL_MINUTES</td><td>{{ cfg.READ_INTERVAL_MINUTES }} min (sensor polling)</td></tr>
         <tr><td>CHECK_INTERVAL_MINUTES</td><td>{{ cfg.CHECK_INTERVAL_MINUTES }} min (min between AC changes)</td></tr>
         <tr><td>FAN_SPEED_TABLE</td><td>{{ cfg.FAN_SPEED_TABLE }}</td></tr>
@@ -1482,9 +1525,14 @@ _DASHBOARD_TEMPLATE = """
     // Value domain: snap to whole degrees (floor min, ceil max), 1°C ticks
     let vMin, vMax;
     if (pts.length > 0) {
-      const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp]).concat([targetTemp]);
-      vMin = Math.floor(Math.min(...allVals));
-      vMax = Math.ceil(Math.max(...allVals));
+      const allVals = pts.flatMap(p => [p.room_temp, p.ac_set_temp, p.target_room_temp, p.average_temp]).filter(v => v !== null && v !== undefined && !isNaN(v));
+      if (allVals.length > 0) {
+        vMin = Math.floor(Math.min(...allVals));
+        vMax = Math.ceil(Math.max(...allVals));
+      } else {
+        vMin = Math.floor(targetTemp - 2);
+        vMax = Math.ceil(targetTemp + 2);
+      }
     } else {
       vMin = Math.floor(targetTemp - 2);
       vMax = Math.ceil(targetTemp + 2);
@@ -1688,25 +1736,29 @@ _DASHBOARD_TEMPLATE = """
       return new Date(s).getTime();
     }
 
-    // Target temp: horizontal dashed line across full width
-    const targetY = ty(targetTemp);
-    svg.appendChild(makeSvgEl('line', {
-      x1: PAD.left, y1: targetY, x2: W - PAD.right, y2: targetY,
-      stroke: '#16a34a', 'stroke-width': '2',
-      'stroke-dasharray': '7,4',
-      'clip-path': 'url(#' + clipId + ')',
-    }));
+    let maxGapMs = 30 * 60 * 1000;
+    if (view === 'week') maxGapMs = 2 * 3600 * 1000;
+    if (view === 'month') maxGapMs = 6 * 3600 * 1000;
 
     if (pts.length > 0) {
-      const roomSeries = pts.map(p => [parseTS(p.timestamp), p.room_temp]);
-      const acSeries   = pts.map(p => [parseTS(p.timestamp), p.ac_set_temp]);
+      const targetSeries = pts.map(p => [parseTS(p.timestamp), (p.target_room_temp !== undefined && p.target_room_temp !== null) ? p.target_room_temp : targetTemp]);
+      const avgSeries    = pts.filter(p => p.average_temp !== null && p.average_temp !== undefined).map(p => [parseTS(p.timestamp), p.average_temp]);
+      const acSeries     = pts.map(p => [parseTS(p.timestamp), p.ac_set_temp]);
+      const roomSeries   = pts.map(p => [parseTS(p.timestamp), p.room_temp]);
 
-      let maxGapMs = 30 * 60 * 1000;
-      if (view === 'week') maxGapMs = 2 * 3600 * 1000;
-      if (view === 'month') maxGapMs = 6 * 3600 * 1000;
-
-      buildPolylineSegments(acSeries,   '#f59e0b', null, maxGapMs);
-      buildPolylineSegments(roomSeries, '#2563eb', null, maxGapMs);
+      buildPolylineSegments(targetSeries, '#16a34a', '7,4', maxGapMs);
+      buildPolylineSegments(avgSeries,    '#38bdf8', '4,3', maxGapMs);
+      buildPolylineSegments(acSeries,     '#f59e0b', null, maxGapMs);
+      buildPolylineSegments(roomSeries,   '#2563eb', null, maxGapMs);
+    } else {
+      // Fallback target temp: horizontal dashed line across full width
+      const targetY = ty(targetTemp);
+      svg.appendChild(makeSvgEl('line', {
+        x1: PAD.left, y1: targetY, x2: W - PAD.right, y2: targetY,
+        stroke: '#16a34a', 'stroke-width': '2',
+        'stroke-dasharray': '7,4',
+        'clip-path': 'url(#' + clipId + ')',
+      }));
     }
 
     // Axes borders
@@ -1765,25 +1817,12 @@ _DASHBOARD_TEMPLATE = """
   window._currentTarget = currentTarget;
   const minTemp = {{ cfg.AC_TEMP_MIN }};
   const maxTemp = {{ cfg.AC_TEMP_MAX }};
-  const fastThresh = {{ cfg.FAST_THRESHOLD }};
 
   function updateButtonStates(val) {
     const upBtn = document.getElementById('targetUpBtn');
     const downBtn = document.getElementById('targetDownBtn');
     if (upBtn) upBtn.disabled = val >= maxTemp;
     if (downBtn) downBtn.disabled = val <= minTemp;
-  }
-
-  function updateDeltaDisplay(targetVal) {
-    const deltaEl = document.getElementById('delta');
-    const roomEl = document.getElementById('room_temp');
-    if (!deltaEl || !roomEl) return;
-    const rt = parseFloat(roomEl.textContent);
-    if (!isNaN(rt)) {
-      const delta = (rt - targetVal).toFixed(1);
-      deltaEl.textContent = (delta >= 0 ? '+' : '') + delta;
-      deltaEl.className = 'value ' + (Math.abs(delta) < fastThresh ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
-    }
   }
 
   function adjustTarget(delta) {
@@ -1814,7 +1853,6 @@ _DASHBOARD_TEMPLATE = """
       const cfgTargetEl = document.getElementById('cfg_target');
       if (cfgTargetEl) cfgTargetEl.textContent = Number(currentTarget).toFixed(1) + ' °C';
       updateButtonStates(currentTarget);
-      updateDeltaDisplay(currentTarget);
       if (window._loadChart) window._loadChart();
     })
     .catch(err => {
@@ -1839,8 +1877,8 @@ function rebuildEventsTable(rows) {
     wrap.innerHTML = '<p style="color:#888;font-size:0.85rem">No changes logged yet.</p>';
     return;
   }
-  const cols = ['timestamp','room_temp','ac_set_temp','delta','ac_action','fan_action'];
-  const heads = ['Timestamp','Room °C','AC Set °C','Delta','AC Action','Fan Action'];
+  const cols = ['timestamp','target_room_temp','room_temp','average_temp','ac_set_temp','ac_action','fan_action'];
+  const heads = ['Timestamp','Target °C','Room °C','Avg °C','AC Set °C','AC Action','Fan Action'];
   let html = '<table><thead><tr>' +
     heads.map(h => '<th>' + h + '</th>').join('') +
     '</tr></thead><tbody>';
@@ -1879,15 +1917,6 @@ setInterval(() => {
         const cfgTargetEl = document.getElementById('cfg_target');
         if (cfgTargetEl) cfgTargetEl.textContent = Number(d.target_room_temp).toFixed(1) + ' °C';
       }
-      if (d.room_temp) {
-        const curTarget = window._currentTarget !== undefined ? window._currentTarget : {{ target }};
-        const delta = (parseFloat(d.room_temp) - curTarget).toFixed(1);
-        const el = document.getElementById('delta');
-        if (el) {
-          el.textContent = (delta >= 0 ? '+' : '') + delta;
-          el.className = 'value ' + (Math.abs(delta) < {{ cfg.FAST_THRESHOLD }} ? 'delta-ok' : delta < 0 ? 'delta-cold' : 'delta-warm');
-        }
-      }
     }).catch(() => {});
 
     // Refresh chart (maintains currently selected view and date)
@@ -1922,16 +1951,17 @@ _LOG_TEMPLATE = """
     {% if rows %}
     <table>
       <thead><tr>
-        <th>Timestamp</th><th>Room °C</th><th>AC Set °C</th>
-        <th>Delta</th><th>AC Action</th><th>Fan Action</th>
+        <th>Timestamp</th><th>Target °C</th><th>Room °C</th><th>Avg °C</th><th>AC Set °C</th>
+        <th>AC Action</th><th>Fan Action</th>
       </tr></thead>
       <tbody>
       {% for r in rows %}
       <tr>
         <td>{{ r.timestamp }}</td>
+        <td>{{ r.target_room_temp }}</td>
         <td>{{ r.room_temp }}</td>
+        <td>{{ r.average_temp }}</td>
         <td>{{ r.ac_set_temp }}</td>
-        <td>{{ r.delta }}</td>
         <td>{{ r.ac_action }}</td>
         <td>{{ r.fan_action }}</td>
       </tr>
@@ -1973,22 +2003,12 @@ def dashboard():
     rows = read_event_rows(max_rows=20)   # only rows where something changed
 
     target_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
-    fast_thresh = config_manager.get("FAST_THRESHOLD", FAST_THRESHOLD)
-
-    delta_class = "delta-ok"
-    if s.get("room_temp") and s["room_temp"] != "N/A":
-        delta = float(s["room_temp"]) - target_temp
-        if delta < -fast_thresh:
-            delta_class = "delta-cold"
-        elif delta > fast_thresh:
-            delta_class = "delta-warm"
 
     return render_template_string(
         _DASHBOARD_TEMPLATE,
         s=s,
         rows=rows,
         target=target_temp,
-        delta_class=delta_class,
         cfg=config_manager.get_all(),
     )
 

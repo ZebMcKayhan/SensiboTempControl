@@ -41,7 +41,7 @@ Every 30 minutes (configurable) the script:
 
 - **Dual-regulator control** — combines a fast regulator for immediate threshold excursions with an in-memory EMA filter for subtle long-term temperature drift, while keeping the on-disk log format clean and consistent.
 - **Heat-mode only** — the script does nothing if the AC is off or in any mode other than `heat`.
-- **Safe limits** — the AC set-point is never pushed below `AC_TEMP_MIN` (20 °C) or above `AC_TEMP_MAX` (27 °C).
+- **Safe limits & dynamic regulation** — hardware limits `AC_TEMP_MIN` (8 °C) and `AC_TEMP_MAX` (30 °C) define the allowable range. Dynamic limits are calculated as `floor(TARGET_ROOM_TEMP) + AC_TEMP_MIN_REL` (-2 °C) to `floor(TARGET_ROOM_TEMP) + AC_TEMP_MAX_REL` (+5 °C), clamped within the hardware bounds.
 - **Fan speed is optional** — if the current AC set-point does not appear in your fan-speed table, the fan is left exactly as it is.
 - **Slow reaction is intentional** — room temperature has a time constant of many hours. Checking every 30 minutes avoids overshooting and ignores transient events like the unit defrosting.
 
@@ -125,8 +125,10 @@ You can set your `SENSIBO_API_KEY` in `sensibo_temp_reg_setting.json`:
   "FAST_THRESHOLD": 0.4,
   "SLOW_THRESHOLD": 0.2,
   "SLOW_TAU": 120,
-  "AC_TEMP_MIN": 20,
-  "AC_TEMP_MAX": 27,
+  "AC_TEMP_MIN": 8,
+  "AC_TEMP_MAX": 30,
+  "AC_TEMP_MIN_REL": -2,
+  "AC_TEMP_MAX_REL": 5,
   "FAN_SPEED_TABLE": {
     "20": 4,
     "21": 4,
@@ -198,9 +200,8 @@ or `http://localhost:8080` if you are on the same machine. Log in with the usern
 
 The dashboard shows:
 
-- **Current status** — room temperature, average temperature (EMA), target (with `↑` and `↓` buttons to adjust target temperature in 0.1 °C steps), AC set-point, fan speed, mode, last checked time
-- **Delta indicator** — colour-coded: 🔵 room too cold / 🟢 within range / 🔴 room too warm
-- **Recent events** — last 20 regulation cycles
+- **Current status** — target temperature (with `↑` and `↓` buttons to adjust in 0.1 °C steps), room temperature, average temperature (EMA), AC set-point, fan speed, mode, last checked time
+- **Recent events** — last 20 regulation cycles where changes occurred
 - **Configuration** — display of settings loaded from `sensibo_temp_reg_setting.json`
 - **Full log** — available at `/log`, shows up to 500 historical entries
 
