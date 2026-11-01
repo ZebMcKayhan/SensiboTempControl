@@ -1139,16 +1139,120 @@ _BASE_STYLE = """
     box-shadow: 0 1px 4px rgba(0,0,0,.12); margin-bottom: 1.25rem;
   }
   .card h2 { font-size: 1rem; font-weight: 600; color: #1e3a5f; margin-bottom: 0.75rem; }
-  .status-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem;
+  .status-layout {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 1.25rem;
+    align-items: stretch;
   }
-  .stat { text-align: center; }
-  .stat .label { font-size: 0.72rem; text-transform: uppercase; color: #666; letter-spacing: .05em; }
-  .stat .value { font-size: 1.8rem; font-weight: 700; color: #1e3a5f; }
+  @media (max-width: 680px) {
+    .status-layout {
+      grid-template-columns: 1fr;
+    }
+  }
+  .target-hero {
+    background: #f0f7ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    text-align: center;
+  }
+  .hero-label {
+    font-size: 0.76rem;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: #1e3a5f;
+    letter-spacing: .05em;
+  }
+  .hero-control {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.85rem;
+    margin: 0.5rem 0;
+  }
+  .hero-value-wrap {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.2rem;
+  }
+  .hero-value {
+    font-size: 3.4rem;
+    font-weight: 800;
+    line-height: 1;
+    color: #1e3a5f;
+  }
+  .hero-unit {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #475569;
+  }
+  .hero-btn-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .hero-btn {
+    background: #2563eb;
+    border: 1px solid #1d4ed8;
+    border-radius: 6px;
+    width: 36px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 1.15rem;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    padding: 0;
+    transition: background .15s, border-color .15s, transform .05s;
+    user-select: none;
+    box-shadow: 0 1px 2px rgba(37,99,235,0.2);
+  }
+  .hero-btn:hover:not(:disabled) {
+    background: #1d4ed8;
+    border-color: #1e40af;
+  }
+  .hero-btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .hero-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    background: #94a3b8;
+    border-color: #cbd5e1;
+    box-shadow: none;
+  }
+  .hero-limits {
+    font-size: 0.74rem;
+    color: #64748b;
+    font-weight: 500;
+  }
+  .hero-limits span {
+    color: #1e3a5f;
+    font-weight: 600;
+  }
+  .telemetry-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+    gap: 0.85rem;
+    align-content: center;
+  }
+  .telemetry-grid .stat {
+    background: #f8fafc;
+    border: 1px solid #f1f5f9;
+    border-radius: 6px;
+    padding: 0.65rem 0.5rem;
+    text-align: center;
+  }
+  .stat .label { font-size: 0.72rem; text-transform: uppercase; color: #666; letter-spacing: .05em; margin-bottom: 0.2rem; }
+  .stat .value { font-size: 1.7rem; font-weight: 700; color: #1e3a5f; }
   .stat .unit  { font-size: 0.85rem; color: #555; }
-  .delta-ok   { color: #16a34a; }
-  .delta-cold { color: #2563eb; }
-  .delta-warm { color: #dc2626; }
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   th { background: #1e3a5f; color: #fff; padding: 0.4rem 0.75rem; text-align: left; }
   td { padding: 0.35rem 0.75rem; border-bottom: 1px solid #e5e7eb; }
@@ -1159,22 +1263,6 @@ _BASE_STYLE = """
     background: #2563eb; color: #fff; font-size: 0.85rem; border: none; cursor: pointer;
   }
   .btn:hover { background: #1d4ed8; }
-  .target-control {
-    display: inline-flex; align-items: center; justify-content: center; gap: 0.45rem;
-  }
-  .target-btn-group {
-    display: inline-flex; flex-direction: column; gap: 3px;
-  }
-  .target-btn {
-    background: #2563eb; border: 1px solid #1d4ed8; border-radius: 4px;
-    width: 26px; height: 20px; display: inline-flex; align-items: center;
-    justify-content: center; cursor: pointer; font-size: 0.85rem; line-height: 1;
-    color: #fff; padding: 0; transition: background .15s, border-color .15s;
-    user-select: none;
-  }
-  .target-btn:hover:not(:disabled) { background: #1d4ed8; border-color: #1e40af; }
-  .target-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-  .stat-primary .value { font-size: 2.6rem; line-height: 1.1; }
   .login-wrap {
     display: flex; align-items: center; justify-content: center; min-height: 100vh;
   }
@@ -1277,40 +1365,47 @@ _DASHBOARD_TEMPLATE = """
   <!-- Status card -->
   <div class="card" id="status-card">
     <h2>Current Status</h2>
-    <div class="status-grid">
-      <div class="stat stat-primary">
-        <div class="label">Target Temp</div>
-        <div class="target-control">
-          <div class="value" id="target_temp">{{ '%.1f'|format(target) }}</div>
-          <div class="target-btn-group">
-            <button type="button" class="target-btn" id="targetUpBtn" title="Increase target temperature by 0.1 °C"{% if target >= cfg.AC_TEMP_MAX %} disabled{% endif %}>↑</button>
-            <button type="button" class="target-btn" id="targetDownBtn" title="Decrease target temperature by 0.1 °C"{% if target <= cfg.AC_TEMP_MIN %} disabled{% endif %}>↓</button>
+    <div class="status-layout">
+      <div class="target-hero">
+        <div class="hero-label">Target Room Temp</div>
+        <div class="hero-control">
+          <div class="hero-value-wrap">
+            <span class="hero-value" id="target_temp">{{ '%.1f'|format(target) }}</span>
+            <span class="hero-unit">°C</span>
+          </div>
+          <div class="hero-btn-group">
+            <button type="button" class="hero-btn" id="targetUpBtn" title="Increase target temperature by 0.1 °C"{% if target >= cfg.AC_TEMP_MAX %} disabled{% endif %}>+</button>
+            <button type="button" class="hero-btn" id="targetDownBtn" title="Decrease target temperature by 0.1 °C"{% if target <= cfg.AC_TEMP_MIN %} disabled{% endif %}>−</button>
           </div>
         </div>
-        <div class="unit">°C</div>
+        <div class="hero-limits">
+          AC range: <span id="hero_limits_range">{{ dyn_min }}° – {{ dyn_max }}°C</span>
+        </div>
       </div>
-      <div class="stat">
-        <div class="label">Room Temp</div>
-        <div class="value" id="room_temp">{{ s.room_temp if s.room_temp else '—' }}</div>
-        <div class="unit">°C</div>
-      </div>
-      <div class="stat">
-        <div class="label">Average Temp</div>
-        <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
-        <div class="unit">°C</div>
-      </div>
-      <div class="stat">
-        <div class="label">AC Set-Point</div>
-        <div class="value" id="ac_set_temp">{{ s.ac_set_temp if s.ac_set_temp else '—' }}</div>
-        <div class="unit">°C</div>
-      </div>
-      <div class="stat">
-        <div class="label">Fan Speed</div>
-        <div class="value" id="ac_fan" style="font-size:1.2rem">{{ s.ac_fan if s.ac_fan else '—' }}</div>
-      </div>
-      <div class="stat">
-        <div class="label">Mode</div>
-        <div class="value" id="ac_mode" style="font-size:1.2rem">{{ s.ac_mode if s.ac_mode else '—' }}</div>
+      <div class="telemetry-grid">
+        <div class="stat">
+          <div class="label">Room Temp</div>
+          <div class="value" id="room_temp">{{ s.room_temp if s.room_temp else '—' }}</div>
+          <div class="unit">°C</div>
+        </div>
+        <div class="stat">
+          <div class="label">Average Temp</div>
+          <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
+          <div class="unit">°C</div>
+        </div>
+        <div class="stat">
+          <div class="label">AC Set-Point</div>
+          <div class="value" id="ac_set_temp">{{ s.ac_set_temp if s.ac_set_temp else '—' }}</div>
+          <div class="unit">°C</div>
+        </div>
+        <div class="stat">
+          <div class="label">Fan Speed</div>
+          <div class="value" id="ac_fan" style="font-size:1.2rem">{{ s.ac_fan if s.ac_fan else '—' }}</div>
+        </div>
+        <div class="stat">
+          <div class="label">Mode</div>
+          <div class="value" id="ac_mode" style="font-size:1.2rem">{{ s.ac_mode if s.ac_mode else '—' }}</div>
+        </div>
       </div>
     </div>
     <p style="font-size:0.75rem;color:#888;margin-top:0.75rem">
@@ -1817,12 +1912,23 @@ _DASHBOARD_TEMPLATE = """
   window._currentTarget = currentTarget;
   const minTemp = {{ cfg.AC_TEMP_MIN }};
   const maxTemp = {{ cfg.AC_TEMP_MAX }};
+  const minRel = {{ cfg.AC_TEMP_MIN_REL }};
+  const maxRel = {{ cfg.AC_TEMP_MAX_REL }};
 
   function updateButtonStates(val) {
     const upBtn = document.getElementById('targetUpBtn');
     const downBtn = document.getElementById('targetDownBtn');
     if (upBtn) upBtn.disabled = val >= maxTemp;
     if (downBtn) downBtn.disabled = val <= minTemp;
+  }
+
+  function updateDynamicLimits(val) {
+    const limitsEl = document.getElementById('hero_limits_range');
+    if (!limitsEl) return;
+    const base = Math.floor(val);
+    const low = Math.max(minTemp, base + minRel);
+    const high = Math.min(maxTemp, base + maxRel);
+    limitsEl.textContent = `${low}° – ${high}°C`;
   }
 
   function adjustTarget(delta) {
@@ -1853,6 +1959,7 @@ _DASHBOARD_TEMPLATE = """
       const cfgTargetEl = document.getElementById('cfg_target');
       if (cfgTargetEl) cfgTargetEl.textContent = Number(currentTarget).toFixed(1) + ' °C';
       updateButtonStates(currentTarget);
+      updateDynamicLimits(currentTarget);
       if (window._loadChart) window._loadChart();
     })
     .catch(err => {
@@ -1867,6 +1974,7 @@ _DASHBOARD_TEMPLATE = """
   if (downBtn) downBtn.addEventListener('click', () => adjustTarget(-0.1));
 
   updateButtonStates(currentTarget);
+  updateDynamicLimits(currentTarget);
 })();
 
 // ── Events table rebuilder ────────────────────────────────────────────────────
@@ -1916,6 +2024,7 @@ setInterval(() => {
         if (downBtn) downBtn.disabled = d.target_room_temp <= {{ cfg.AC_TEMP_MIN }};
         const cfgTargetEl = document.getElementById('cfg_target');
         if (cfgTargetEl) cfgTargetEl.textContent = Number(d.target_room_temp).toFixed(1) + ' °C';
+        updateDynamicLimits(d.target_room_temp);
       }
     }).catch(() => {});
 
@@ -2002,14 +2111,20 @@ def dashboard():
     s = get_shared_state()
     rows = read_event_rows(max_rows=20)   # only rows where something changed
 
-    target_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
+    cfg = config_manager.get_all()
+    target_temp = cfg.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
+    base = math.floor(target_temp)
+    dyn_min = max(cfg.get("AC_TEMP_MIN", AC_TEMP_MIN), base + cfg.get("AC_TEMP_MIN_REL", AC_TEMP_MIN_REL))
+    dyn_max = min(cfg.get("AC_TEMP_MAX", AC_TEMP_MAX), base + cfg.get("AC_TEMP_MAX_REL", AC_TEMP_MAX_REL))
 
     return render_template_string(
         _DASHBOARD_TEMPLATE,
         s=s,
         rows=rows,
         target=target_temp,
-        cfg=config_manager.get_all(),
+        dyn_min=dyn_min,
+        dyn_max=dyn_max,
+        cfg=cfg,
     )
 
 
