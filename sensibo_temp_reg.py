@@ -67,6 +67,10 @@ FAN_SPEED_TABLE = {
 READ_INTERVAL_MINUTES  = 5      # minutes between sensor read + regulation checks
 CHECK_INTERVAL_MINUTES = 30     # minimum minutes between AC set-point changes
 
+# ── Outdoor temperature (Open-Meteo) ──────────────────────────────────────────
+OUTDOOR_LATITUDE  = 0.0         # °N  — 0.0/0.0 disables outdoor temp feature
+OUTDOOR_LONGITUDE = 0.0         # °E  — set both to your location to enable
+
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_HOST     = "0.0.0.0"
 WEB_PORT     = 8585
@@ -129,6 +133,8 @@ DEFAULT_CONFIG = {
     "FAN_SPEED_TABLE": FAN_SPEED_TABLE,
     "READ_INTERVAL_MINUTES": READ_INTERVAL_MINUTES,
     "CHECK_INTERVAL_MINUTES": CHECK_INTERVAL_MINUTES,
+    "OUTDOOR_LATITUDE": OUTDOOR_LATITUDE,
+    "OUTDOOR_LONGITUDE": OUTDOOR_LONGITUDE,
     "WEB_HOST": WEB_HOST,
     "WEB_PORT": WEB_PORT,
     "WEB_USERNAME": WEB_USERNAME,
@@ -216,6 +222,10 @@ class ConfigManager:
             cfg["CHECK_INTERVAL_MINUTES"] = int(cfg["CHECK_INTERVAL_MINUTES"])
         if "WEB_PORT" in cfg:
             cfg["WEB_PORT"] = int(cfg["WEB_PORT"])
+        if "OUTDOOR_LATITUDE" in cfg:
+            cfg["OUTDOOR_LATITUDE"] = round(float(cfg["OUTDOOR_LATITUDE"]), 2)
+        if "OUTDOOR_LONGITUDE" in cfg:
+            cfg["OUTDOOR_LONGITUDE"] = round(float(cfg["OUTDOOR_LONGITUDE"]), 2)
         return cfg
 
     def _validate(self, cfg: dict) -> None:
@@ -418,10 +428,137 @@ def update_ema_filter(room_temp: float, now_epoch: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Outdoor temperature fetcher (Open-Meteo API)
+# ---------------------------------------------------------------------------
+_OUTDOOR_TEMP_MAX_AGE = 3600   # seconds — readings older than this are not logged or shown
+
+
+class OutdoorTempFetcher:
+    """
+    Fetches outdoor temperature from the Open-Meteo API once per regulation cycle.
+
+    Timestamp handling
+    ------------------
+    Open-Meteo returns a 'current.time' field that may be in the past (a recent
+    measurement) or the future (a forecast for the next interval).  To avoid
+    overwriting a usable past reading with a future one, readings are stored in
+    a dict keyed by their API timestamp.  Each unique timestamp is an independent
+    slot; same-timestamp fetches overwrite (temp update for the same interval).
+    A new future timestamp from the API does NOT overwrite a different timestamp
+    already stored (e.g. a past reading that is still being logged consecutively).
+    A reading is eligible for logging at the first regulation cycle whose
+    wall-clock time is >= the reading's API timestamp AND the reading is no more
+    than _OUTDOOR_TEMP_MAX_AGE (1 h) old.
+    """
+
+    OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+    MAX_AGE_SECONDS = _OUTDOOR_TEMP_MAX_AGE
+
+    def __init__(self, latitude: float, longitude: float):
+        self.latitude  = round(latitude,  2)
+        self.longitude = round(longitude, 2)
+        self._lock = threading.Lock()
+        # {api_time (datetime) -> {"temp": float, "fetch_time": datetime}}
+        self._readings: dict = {}
+        # Latest raw fetch result — always updated, used for the status widget
+        self._last_fetch_temp: float | None = None
+        self._last_fetch_api_time: datetime | None = None
+
+    def fetch(self, now: datetime) -> None:
+        """
+        Call the Open-Meteo API and store the result keyed by its API timestamp.
+        On failure, logs a warning but does not raise.
+        """
+        from datetime import timedelta
+        try:
+            resp = requests.get(
+                self.OPEN_METEO_URL,
+                params={
+                    "latitude":  self.latitude,
+                    "longitude": self.longitude,
+                    "current":   "temperature_2m",
+                    "timezone":  "auto",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data    = resp.json()
+            current = data.get("current", {})
+            temp_raw = current.get("temperature_2m")
+            time_raw = current.get("time")
+            if temp_raw is None or time_raw is None:
+                log.warning("Outdoor temp: unexpected Open-Meteo response (missing fields)")
+                return
+            # API returns "YYYY-MM-DDTHH:MM" (no seconds component)
+            api_time = datetime.strptime(time_raw, "%Y-%m-%dT%H:%M")
+            temp     = float(temp_raw)
+
+            with self._lock:
+                # Same-timestamp fetches overwrite; different timestamps coexist
+                self._readings[api_time] = {"temp": temp, "fetch_time": now}
+                self._last_fetch_temp     = temp
+                self._last_fetch_api_time = api_time
+                # Prune readings too old to ever be useful (> MAX_AGE + 10 min buffer)
+                cutoff = now - timedelta(seconds=self.MAX_AGE_SECONDS + 600)
+                self._readings = {t: v for t, v in self._readings.items() if t >= cutoff}
+
+        except requests.RequestException as exc:
+            log.warning("Outdoor temp fetch failed: %s", exc)
+        except (ValueError, KeyError, AttributeError) as exc:
+            log.warning("Outdoor temp parse error: %s", exc)
+
+    def get_loggable_temp(self, now: datetime) -> float | None:
+        """
+        Return the temperature value to write to the log this cycle, or None.
+
+        Selects the most recent API timestamp that is <= now (past or present) and
+        no more than MAX_AGE_SECONDS old.  Future-timestamped readings are skipped
+        (not yet due).  Consecutive cycles with no new past timestamp keep returning
+        the same reading until it ages out at MAX_AGE_SECONDS.
+        """
+        with self._lock:
+            past = {t: v for t, v in self._readings.items() if t <= now}
+            if not past:
+                return None
+            best_time = max(past.keys())
+            age = (now - best_time).total_seconds()
+            if age > self.MAX_AGE_SECONDS:
+                return None
+            return past[best_time]["temp"]
+
+    def get_status(self) -> tuple[float | None, datetime | None]:
+        """
+        Return (latest_temp, latest_api_time) for the status widget.
+        Always returns the most recent fetch result regardless of timestamp age.
+        The caller is responsible for the >1 h staleness check.
+        """
+        with self._lock:
+            return self._last_fetch_temp, self._last_fetch_api_time
+
+
+def _outdoor_feature_enabled(lat: float, lon: float) -> bool:
+    """Feature is active when either coordinate is outside the ±0.001° dead-band."""
+    return abs(lat) > 0.001 or abs(lon) > 0.001
+
+
+_outdoor_lat = config_manager.get("OUTDOOR_LATITUDE", OUTDOOR_LATITUDE)
+_outdoor_lon = config_manager.get("OUTDOOR_LONGITUDE", OUTDOOR_LONGITUDE)
+if _outdoor_feature_enabled(_outdoor_lat, _outdoor_lon):
+    outdoor_fetcher: OutdoorTempFetcher | None = OutdoorTempFetcher(_outdoor_lat, _outdoor_lon)
+    log.info(
+        "Outdoor temperature feature enabled (lat=%.2f, lon=%.2f)",
+        _outdoor_lat, _outdoor_lon,
+    )
+else:
+    outdoor_fetcher = None
+    log.info("Outdoor temperature feature disabled (OUTDOOR_LATITUDE/LONGITUDE not configured)")
+
+
+# ---------------------------------------------------------------------------
 # Log file helpers
 # ---------------------------------------------------------------------------
 _log_lock = threading.Lock()
-LOG_FIELDS = ["timestamp", "target_room_temp", "room_temp", "average_temp", "ac_set_temp", "ac_action", "fan_action", "changed"]
+LOG_FIELDS = ["timestamp", "target_room_temp", "room_temp", "average_temp", "ac_set_temp", "ac_action", "fan_action", "changed", "outdoor_temp"]
 
 def _log_file_path() -> str:
     log_file = config_manager.get("LOG_FILE", "/var/log/sensibo/sensibo_reg.log")
@@ -574,12 +711,17 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
             avg = float(r["average_temp"])
         except (ValueError, KeyError):
             avg = None
+        try:
+            odtemp = float(r.get("outdoor_temp", ""))
+        except (ValueError, KeyError, TypeError):
+            odtemp = None
         raw_points.append({
             "ts": ts,
             "room_temp": rt,
             "ac_set_temp": ac,
             "target_room_temp": tgt,
             "average_temp": avg,
+            "outdoor_temp": odtemp,
         })
 
     # Deduplicate by timestamp (last logged entry wins) and sort chronologically
@@ -610,6 +752,8 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
             last_tgt = g_list[-1]["target_room_temp"]
             valid_avgs = [p["average_temp"] for p in g_list if p["average_temp"] is not None]
             avg_avg = round(sum(valid_avgs) / len(valid_avgs), 2) if valid_avgs else None
+            valid_od = [p["outdoor_temp"] for p in g_list if p.get("outdoor_temp") is not None]
+            avg_od = round(sum(valid_od) / len(valid_od), 1) if valid_od else None
             b_ts = start_dt + timedelta(seconds=(b_idx + 0.5) * bucket_seconds)
             points.append({
                 "timestamp": b_ts.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -617,6 +761,7 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
                 "average_temp": avg_avg,
                 "ac_set_temp": last_ac,
                 "target_room_temp": last_tgt,
+                "outdoor_temp": avg_od,
             })
     else:
         points = [
@@ -626,6 +771,7 @@ def read_chart_data(view: str = "24h", date_str: str | None = None) -> dict:
                 "average_temp": p["average_temp"],
                 "ac_set_temp": p["ac_set_temp"],
                 "target_room_temp": p["target_room_temp"],
+                "outdoor_temp": p.get("outdoor_temp"),
             }
             for p in sorted_points
         ]
@@ -909,7 +1055,8 @@ def regulate(
         (changed, regulator_source) where regulator_source is 'fast', 'slow', or None.
     """
     target_room_temp = config_manager.get("TARGET_ROOM_TEMP", TARGET_ROOM_TEMP)
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    now_dt    = datetime.now()
+    now       = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
     now_epoch = time.time()
     ac_action = "Error"
     fan_action = "Error"
@@ -918,6 +1065,17 @@ def regulate(
     ac_set_temp = None
     changed = False
     regulator_source: str | None = None
+
+    # Fetch outdoor temp (always runs regardless of Sensibo success)
+    outdoor_temp_loggable: float | None = None
+    if outdoor_fetcher is not None:
+        outdoor_fetcher.fetch(now_dt)
+        outdoor_temp_loggable = outdoor_fetcher.get_loggable_temp(now_dt)
+        od_temp, od_time = outdoor_fetcher.get_status()
+        update_shared_state(
+            outdoor_temp=od_temp,
+            outdoor_temp_time=od_time.strftime("%Y-%m-%dT%H:%M") if od_time is not None else None,
+        )
 
     try:
         # 1. Read current AC state and room measurement (single API call)
@@ -1036,6 +1194,7 @@ def regulate(
         "ac_action": ac_action,
         "fan_action": fan_action,
         "changed": "yes" if changed else "no",
+        "outdoor_temp": f"{outdoor_temp_loggable:.1f}" if outdoor_temp_loggable is not None else "",
     })
 
     return changed, regulator_source
@@ -1393,6 +1552,14 @@ _DASHBOARD_TEMPLATE = """
           <div class="value" id="avg_temp">{{ '%.2f'|format(s.avg_temp) if s.avg_temp is defined and s.avg_temp is not none else '—' }}</div>
           <div class="unit">°C</div>
         </div>
+        {% if outdoor_enabled %}
+        <div class="stat">
+          <div class="label">Outdoor Temp</div>
+          <div class="value" id="outdoor_temp">{{ outdoor_temp_display }}</div>
+          <div class="unit">°C</div>
+          <div style="font-size:0.68rem;color:#888;margin-top:0.15rem" id="outdoor_temp_time">{{ outdoor_temp_time_display }}</div>
+        </div>
+        {% endif %}
         <div class="stat">
           <div class="label">AC Set-Point</div>
           <div class="value" id="ac_set_temp">{{ s.ac_set_temp if s.ac_set_temp else '—' }}</div>
@@ -1453,6 +1620,22 @@ _DASHBOARD_TEMPLATE = """
         <span>Target Temp</span>
       </div>
     </div>
+    {% if outdoor_enabled %}
+    <div style="margin-top:0.75rem;border-top:1px solid #f1f5f9;padding-top:0.75rem">
+      <div style="font-size:0.78rem;font-weight:600;color:#1e3a5f;margin-bottom:0.3rem">Outdoor Temperature</div>
+      <div class="chart-wrap">
+        <svg id="outdoorChart" viewBox="0 0 900 240" preserveAspectRatio="none"
+             aria-label="Outdoor temperature chart"></svg>
+        <p class="chart-empty" id="outdoorChartEmpty" style="display:none">No outdoor data for this period.</p>
+      </div>
+      <div class="chart-legend">
+        <div class="legend-item">
+          <div class="legend-swatch" style="background:#f97316"></div>
+          <span>Outdoor Temp</span>
+        </div>
+      </div>
+    </div>
+    {% endif %}
   </div>
 
   <!-- Recent events (changes only) -->
@@ -1596,6 +1779,113 @@ _DASHBOARD_TEMPLATE = """
     loadChart();
   }
 
+  // ── Shared X-axis renderer (used by main chart and outdoor chart) ─────────
+  function drawXAxis(svg, view, tStart, tEnd, txFn, W_px, H_px, pad) {
+    if (view === '24h') {
+      const tStartDate = new Date(tStart);
+      let firstHour = new Date(tStartDate);
+      firstHour.setMinutes(0, 0, 0, 0);
+      firstHour.setTime(firstHour.getTime() + 3600 * 1000);
+      if (firstHour.getHours() % 2 !== 0) {
+        firstHour.setTime(firstHour.getTime() + 3600 * 1000);
+      }
+      for (let t = firstHour.getTime(); t < tEnd; t += 3600 * 1000) {
+        const x = txFn(t);
+        const hr = new Date(t).getHours();
+        const isEven = (hr % 2 === 0);
+        if (isEven) {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: pad.top, x2: x, y2: H_px - pad.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H_px - pad.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+          svg.appendChild(lbl);
+        } else {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H_px - pad.bottom, x2: x, y2: H_px - pad.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
+      }
+    } else if (view === 'day') {
+      for (let hr = 0; hr <= 24; hr++) {
+        const t = tStart + hr * 3600 * 1000;
+        const x = txFn(t);
+        const isEven = (hr % 2 === 0);
+        if (isEven) {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: pad.top, x2: x, y2: H_px - pad.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H_px - pad.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
+          svg.appendChild(lbl);
+        } else {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H_px - pad.bottom, x2: x, y2: H_px - pad.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
+      }
+    } else if (view === 'week') {
+      const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      for (let i = 0; i < 7; i++) {
+        const dayStart = tStart + i * 24 * 3600 * 1000;
+        const x = txFn(dayStart);
+        svg.appendChild(makeSvgEl('line', {
+          x1: x, y1: pad.top, x2: x, y2: H_px - pad.bottom,
+          stroke: '#e5e7eb', 'stroke-width': '1',
+        }));
+        const dDate = new Date(dayStart);
+        const lbl = makeSvgEl('text', {
+          x: x + 4, y: H_px - pad.bottom + 14,
+          'text-anchor': 'start', 'font-size': '11', fill: '#888',
+        });
+        lbl.textContent = dayNames[i] + ' ' + dDate.getDate();
+        svg.appendChild(lbl);
+        const noon = dayStart + 12 * 3600 * 1000;
+        const noonX = txFn(noon);
+        svg.appendChild(makeSvgEl('line', {
+          x1: noonX, y1: H_px - pad.bottom, x2: noonX, y2: H_px - pad.bottom + 4,
+          stroke: '#cbd5e1', 'stroke-width': '1',
+        }));
+      }
+    } else if (view === 'month') {
+      const mStart = new Date(tStart);
+      const year = mStart.getFullYear();
+      const month = mStart.getMonth();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dTime = new Date(year, month, d).getTime();
+        const x = txFn(dTime);
+        if (d % 2 === 0) {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: pad.top, x2: x, y2: H_px - pad.bottom,
+            stroke: '#e5e7eb', 'stroke-width': '1',
+          }));
+          const lbl = makeSvgEl('text', {
+            x: x, y: H_px - pad.bottom + 14,
+            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
+          });
+          lbl.textContent = String(d);
+          svg.appendChild(lbl);
+        } else {
+          svg.appendChild(makeSvgEl('line', {
+            x1: x, y1: H_px - pad.bottom, x2: x, y2: H_px - pad.bottom + 4,
+            stroke: '#cbd5e1', 'stroke-width': '1',
+          }));
+        }
+      }
+    }
+  }
+
   function renderChart(data) {
     const svg = document.getElementById('tempChart');
     const emptyMsg = document.getElementById('chartEmpty');
@@ -1664,118 +1954,7 @@ _DASHBOARD_TEMPLATE = """
     }
 
     // ── X-axis ticks & grid lines per view ─────────────────────────────────
-    if (view === '24h') {
-      const tStartDate = new Date(tStart);
-      let firstHour = new Date(tStartDate);
-      firstHour.setMinutes(0, 0, 0, 0);
-      firstHour.setTime(firstHour.getTime() + 3600 * 1000);
-      if (firstHour.getHours() % 2 !== 0) {
-        firstHour.setTime(firstHour.getTime() + 3600 * 1000);
-      }
-      for (let t = firstHour.getTime(); t < tEnd; t += 3600 * 1000) {
-        const x = tx(t);
-        const hr = new Date(t).getHours();
-        const isEven = (hr % 2 === 0);
-        if (isEven) {
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
-            stroke: '#e5e7eb', 'stroke-width': '1',
-          }));
-          const lbl = makeSvgEl('text', {
-            x: x, y: H - PAD.bottom + 14,
-            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
-          });
-          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
-          svg.appendChild(lbl);
-        } else {
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
-            stroke: '#cbd5e1', 'stroke-width': '1',
-          }));
-        }
-      }
-    } else if (view === 'day') {
-      // 00:00 to 24:00 (24 hours)
-      for (let hr = 0; hr <= 24; hr++) {
-        const t = tStart + hr * 3600 * 1000;
-        const x = tx(t);
-        const isEven = (hr % 2 === 0);
-        if (isEven) {
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
-            stroke: '#e5e7eb', 'stroke-width': '1',
-          }));
-          const lbl = makeSvgEl('text', {
-            x: x, y: H - PAD.bottom + 14,
-            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
-          });
-          lbl.textContent = hr.toString().padStart(2, '0') + ':00';
-          svg.appendChild(lbl);
-        } else {
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
-            stroke: '#cbd5e1', 'stroke-width': '1',
-          }));
-        }
-      }
-    } else if (view === 'week') {
-      // Monday 00:00 to Sunday 24:00 (7 days)
-      const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      for (let i = 0; i < 7; i++) {
-        const dayStart = tStart + i * 24 * 3600 * 1000;
-        const x = tx(dayStart);
-        // Major tick: 00:00 every day
-        svg.appendChild(makeSvgEl('line', {
-          x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
-          stroke: '#e5e7eb', 'stroke-width': '1',
-        }));
-        const dDate = new Date(dayStart);
-        const lbl = makeSvgEl('text', {
-          x: x + 4, y: H - PAD.bottom + 14,
-          'text-anchor': 'start', 'font-size': '11', fill: '#888',
-        });
-        lbl.textContent = dayNames[i] + ' ' + dDate.getDate();
-        svg.appendChild(lbl);
-
-        // Minor tick: 12:00 noon every day
-        const noon = dayStart + 12 * 3600 * 1000;
-        const noonX = tx(noon);
-        svg.appendChild(makeSvgEl('line', {
-          x1: noonX, y1: H - PAD.bottom, x2: noonX, y2: H - PAD.bottom + 4,
-          stroke: '#cbd5e1', 'stroke-width': '1',
-        }));
-      }
-    } else if (view === 'month') {
-      // 1st 00:00 to last day 24:00
-      const mStart = new Date(tStart);
-      const year = mStart.getFullYear();
-      const month = mStart.getMonth();
-      const daysInMonth = new Date(year, month + 1, 0).getDate();
-
-      for (let d = 1; d <= daysInMonth; d++) {
-        const dTime = new Date(year, month, d).getTime();
-        const x = tx(dTime);
-        if (d % 2 === 0) {
-          // Major tick: even days at 00:00
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: PAD.top, x2: x, y2: H - PAD.bottom,
-            stroke: '#e5e7eb', 'stroke-width': '1',
-          }));
-          const lbl = makeSvgEl('text', {
-            x: x, y: H - PAD.bottom + 14,
-            'text-anchor': 'middle', 'font-size': '11', fill: '#888',
-          });
-          lbl.textContent = String(d);
-          svg.appendChild(lbl);
-        } else {
-          // Minor tick: odd days at 00:00
-          svg.appendChild(makeSvgEl('line', {
-            x1: x, y1: H - PAD.bottom, x2: x, y2: H - PAD.bottom + 4,
-            stroke: '#cbd5e1', 'stroke-width': '1',
-          }));
-        }
-      }
-    }
+    drawXAxis(svg, view, tStart, tEnd, tx, W, H, PAD);
 
     // ── Clip rect so lines don't overflow plot area ───────────────────────
     const clipId = 'chartClip';
@@ -1867,6 +2046,144 @@ _DASHBOARD_TEMPLATE = """
     }));
   }
 
+  // ── Outdoor temperature chart renderer ───────────────────────────────────
+  function renderOutdoorChart(data) {
+    const svg = document.getElementById('outdoorChart');
+    if (!svg) return; // feature disabled — element not in DOM
+    const emptyMsg = document.getElementById('outdoorChartEmpty');
+
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    const odPts = (data && data.points)
+      ? data.points.filter(p => p.outdoor_temp !== null && p.outdoor_temp !== undefined)
+      : [];
+    const view = (data && data.view) ? data.view : currentView;
+
+    if (odPts.length === 0) {
+      if (emptyMsg) emptyMsg.style.display = '';
+      svg.style.display = '';
+      return;
+    }
+    if (emptyMsg) emptyMsg.style.display = 'none';
+    svg.style.display = '';
+
+    const tStart = data.start_iso ? new Date(data.start_iso).getTime() : (Date.now() - 24 * 3600 * 1000);
+    const tEnd   = data.end_iso   ? new Date(data.end_iso).getTime()   : Date.now();
+    const plotW  = W - PAD.left - PAD.right;
+    const plotH  = H - PAD.top  - PAD.bottom;
+
+    // Y-axis domain
+    const vals = odPts.map(p => p.outdoor_temp);
+    let vMin = Math.floor(Math.min(...vals));
+    let vMax = Math.ceil(Math.max(...vals));
+    if (vMin === vMax) { vMin -= 1; vMax += 1; }
+    const span = vMax - vMin;
+
+    // Tick rules: major gridline step and optional minor step
+    let majorStep, minorStep;
+    if (span <= 10)      { majorStep = 1; minorStep = null; }
+    else if (span <= 20) { majorStep = 2; minorStep = 1; }
+    else                 { majorStep = 5; minorStep = 1; }
+
+    function tx(epochMs) {
+      if (tEnd <= tStart) return PAD.left;
+      return PAD.left + ((epochMs - tStart) / (tEnd - tStart)) * plotW;
+    }
+    function ty(val) {
+      return PAD.top + plotH - ((val - vMin) / (vMax - vMin)) * plotH;
+    }
+
+    // Minor cross-ticks on Y axis + light gridlines
+    if (minorStep !== null) {
+      let mv = Math.ceil(vMin / minorStep) * minorStep;
+      for (; mv <= vMax; mv += minorStep) {
+        if (mv % majorStep === 0) continue;
+        const y = ty(mv);
+        svg.appendChild(makeSvgEl('line', {
+          x1: PAD.left - 4, y1: y, x2: PAD.left, y2: y,
+          stroke: '#cbd5e1', 'stroke-width': '1',
+        }));
+        svg.appendChild(makeSvgEl('line', {
+          x1: PAD.left, y1: y, x2: W - PAD.right, y2: y,
+          stroke: '#f1f5f9', 'stroke-width': '1',
+        }));
+      }
+    }
+
+    // Major gridlines and Y-axis labels
+    let mv2 = Math.ceil(vMin / majorStep) * majorStep;
+    for (; mv2 <= vMax; mv2 += majorStep) {
+      const y = ty(mv2);
+      svg.appendChild(makeSvgEl('line', {
+        x1: PAD.left, y1: y, x2: W - PAD.right, y2: y,
+        stroke: '#e5e7eb', 'stroke-width': '1',
+      }));
+      const lbl = makeSvgEl('text', {
+        x: PAD.left - 5, y: y + 4,
+        'text-anchor': 'end', 'font-size': '11', fill: '#888',
+      });
+      lbl.textContent = String(mv2);
+      svg.appendChild(lbl);
+    }
+
+    // X-axis (identical scale/ticks to main chart)
+    drawXAxis(svg, view, tStart, tEnd, tx, W, H, PAD);
+
+    // Clip rect
+    const clipId = 'outdoorClip';
+    const defs = makeSvgEl('defs', {});
+    const clip = makeSvgEl('clipPath', { id: clipId });
+    clip.appendChild(makeSvgEl('rect', {
+      x: PAD.left, y: PAD.top, width: plotW, height: plotH,
+    }));
+    defs.appendChild(clip);
+    svg.appendChild(defs);
+
+    // Gap threshold (same as main chart)
+    let maxGapMs = 30 * 60 * 1000;
+    if (view === 'week')  maxGapMs = 2 * 3600 * 1000;
+    if (view === 'month') maxGapMs = 6 * 3600 * 1000;
+
+    // Build segmented polyline (break on gaps)
+    const series = odPts.map(p => [new Date(p.timestamp).getTime(), p.outdoor_temp]);
+    const chunks = [];
+    if (series.length > 0) {
+      let cur = [series[0]];
+      for (let i = 1; i < series.length; i++) {
+        if (series[i][0] - series[i - 1][0] > maxGapMs) { chunks.push(cur); cur = []; }
+        cur.push(series[i]);
+      }
+      if (cur.length > 0) chunks.push(cur);
+    }
+    for (const chunk of chunks) {
+      if (chunk.length === 1) {
+        const [t, v] = chunk[0];
+        svg.appendChild(makeSvgEl('circle', {
+          cx: tx(t).toFixed(1), cy: ty(v).toFixed(1), r: '2.5',
+          fill: '#f97316', 'clip-path': 'url(#' + clipId + ')',
+        }));
+        continue;
+      }
+      const pts_str = chunk.map(([t, v]) => tx(t).toFixed(1) + ',' + ty(v).toFixed(1)).join(' ');
+      svg.appendChild(makeSvgEl('polyline', {
+        points: pts_str, fill: 'none',
+        stroke: '#f97316', 'stroke-width': '2',
+        'stroke-linejoin': 'miter', 'stroke-linecap': 'square',
+        'clip-path': 'url(#' + clipId + ')',
+      }));
+    }
+
+    // Axes borders
+    svg.appendChild(makeSvgEl('line', {
+      x1: PAD.left, y1: PAD.top, x2: PAD.left, y2: H - PAD.bottom,
+      stroke: '#cbd5e1', 'stroke-width': '1',
+    }));
+    svg.appendChild(makeSvgEl('line', {
+      x1: PAD.left, y1: H - PAD.bottom, x2: W - PAD.right, y2: H - PAD.bottom,
+      stroke: '#cbd5e1', 'stroke-width': '1',
+    }));
+  }
+
   function loadChart() {
     const url = `/api/chart?view=${currentView}&date=${formatIsoDate(currentDate)}`;
     fetch(url)
@@ -1888,6 +2205,7 @@ _DASHBOARD_TEMPLATE = """
         }
 
         renderChart(data);
+        renderOutdoorChart(data);
       })
       .catch(() => {});
   }
@@ -1997,6 +2315,28 @@ function rebuildEventsTable(rows) {
   wrap.innerHTML = html;
 }
 
+// ── Outdoor temp status box updater ──────────────────────────────────────────
+function updateOutdoorTempDisplay(temp, timeIso) {
+  const tempEl = document.getElementById('outdoor_temp');
+  const timeEl = document.getElementById('outdoor_temp_time');
+  if (!tempEl) return; // feature disabled — element not in DOM
+  if (temp === null || temp === undefined || timeIso === null || timeIso === undefined) {
+    tempEl.textContent = '—';
+    if (timeEl) timeEl.textContent = '';
+    return;
+  }
+  // API time is "YYYY-MM-DDTHH:MM" — append seconds for reliable Date parsing
+  const isoStr = (typeof timeIso === 'string' && timeIso.length === 16) ? timeIso + ':00' : timeIso;
+  const apiTime = new Date(isoStr);
+  const ageMs = Date.now() - apiTime.getTime(); // negative = future timestamp
+  tempEl.textContent = (ageMs > 3600 * 1000) ? 'N/A' : Number(temp).toFixed(1);
+  if (timeEl) {
+    const h = String(apiTime.getHours()).padStart(2, '0');
+    const m = String(apiTime.getMinutes()).padStart(2, '0');
+    timeEl.textContent = h + ':' + m;
+  }
+}
+
 // ── Countdown / auto-refresh loop ─────────────────────────────────────────────
 let countdown = 300;
 const countEl = document.getElementById('countdown');
@@ -2015,6 +2355,7 @@ setInterval(() => {
       set('ac_fan',      d.ac_fan      ?? '—');
       set('ac_mode',     d.ac_mode     ?? '—');
       set('last_checked',d.last_checked ?? '—');
+      updateOutdoorTempDisplay(d.outdoor_temp ?? null, d.outdoor_temp_time ?? null);
       if (d.target_room_temp !== undefined) {
         window._currentTarget = d.target_room_temp;
         set('target_temp', Number(d.target_room_temp).toFixed(1));
@@ -2117,6 +2458,22 @@ def dashboard():
     dyn_min = max(cfg.get("AC_TEMP_MIN", AC_TEMP_MIN), base + cfg.get("AC_TEMP_MIN_REL", AC_TEMP_MIN_REL))
     dyn_max = min(cfg.get("AC_TEMP_MAX", AC_TEMP_MAX), base + cfg.get("AC_TEMP_MAX_REL", AC_TEMP_MAX_REL))
 
+    # Outdoor temp display values for initial page render
+    outdoor_enabled = outdoor_fetcher is not None
+    outdoor_temp_display = "—"
+    outdoor_temp_time_display = ""
+    if outdoor_enabled:
+        od_temp = s.get("outdoor_temp")
+        od_time_iso = s.get("outdoor_temp_time")
+        if od_temp is not None and od_time_iso is not None:
+            try:
+                od_time_dt = datetime.strptime(od_time_iso, "%Y-%m-%dT%H:%M")
+                age_secs = (datetime.now() - od_time_dt).total_seconds()
+                outdoor_temp_time_display = od_time_dt.strftime("%H:%M")
+                outdoor_temp_display = "N/A" if age_secs > 3600 else f"{od_temp:.1f}"
+            except (ValueError, TypeError):
+                pass
+
     return render_template_string(
         _DASHBOARD_TEMPLATE,
         s=s,
@@ -2125,6 +2482,9 @@ def dashboard():
         dyn_min=dyn_min,
         dyn_max=dyn_max,
         cfg=cfg,
+        outdoor_enabled=outdoor_enabled,
+        outdoor_temp_display=outdoor_temp_display,
+        outdoor_temp_time_display=outdoor_temp_time_display,
     )
 
 
